@@ -1,0 +1,3354 @@
+
+Load all the required libraries:
+
+```{r}
+library("httr")
+library("jsonlite")
+library("tidyverse")
+library("lubridate")
+library("rvest")
+library("stringr")
+library("textTinyR")
+library("tm")
+library("readr")
+library(readxl)
+library(dplyr)
+library(doc2vec)
+library(tokenizers.bpe)
+library(udpipe)
+library(textTinyR)
+library(tm)
+library(cluster)
+library(igraph)
+library(RSelenium)
+library(tidyverse)
+library(rvest)
+library(xml2)
+library(netstat)
+library("quanteda")
+library("stm")
+library("tidyverse")
+library("stringi")
+library(fastDummies)
+library(igraph)
+library(GGally)
+library(network)
+library(sna)
+library(ggplot2)
+library(SHAPforxgboost)
+library(DataExplorer)
+library(naniar)
+library(xgboost)
+library(data.table)
+library(mlr)
+library(dplyr)
+library(caret)
+library(pROC)
+library(MLmetrics)
+library(PRROC)
+
+```
+
+
+Load in the Crunchbase API key from the .env file:
+```{r}
+readRenviron("crunchbase_api.env")
+apikey <- Sys.getenv("KEY")
+
+```
+
+Code for extracting the relevant organizations from the Crunchbase database, with custom filters: Companies founded in India and between 2013-Jun'24, with at least 1 funding round. The code makes a POST request to the Crunchbase API, extracts the relevant data, and stores it in a JSON file for further analysis.
+
+Note: the extracted org details from Crunchbase API are stored in a JSON file, that can be loaded for further analysis. 
+```{r, org_details}
+# Define the base url for the organization endpoint
+base_url <- "https://api.crunchbase.com/api/v4/searches/organizations?user_key="
+
+# Combine the base url and the API key
+url <- paste0(base_url, apikey)
+
+# Define the initial payload for the POST request
+initial_payload <- "{\"query\":[{\"operator_id\":\"includes\",\"type\":\"predicate\",\"field_id\":\"location_identifiers\",\"values\":[\"India\"]},{\"operator_id\":\"gte\",\"type\":\"predicate\",\"field_id\":\"founded_on\",\"values\":[\"2013\"]},{\"operator_id\":\"gte\",\"type\":\"predicate\",\"field_id\":\"num_funding_rounds\",\"values\":[1]}],\"limit\":1000,\"field_ids\":[\"legal_name\",\"identifier\",\"location_identifiers\",\"name\",\"categories\",\"category_groups\",\"description\",\"status\",\"linkedin\",\"founded_on\",\"ipo_status\",\"closed_on\",\"exited_on\",\"num_funding_rounds\",\"went_public_on\"],\"order\":[{\"sort\":\"desc\",\"field_id\":\"founded_on\"}]}"
+
+# Placeholder for storing all organization data
+all_org <- list()
+
+for (i in 1:9) {
+  # If it's the first iteration, use the initial payload without an after_id
+  if (i == 1) {
+    payload <- initial_payload
+  } else {
+    # Extract the UUID of the last company (1000th row) from the previous response
+    last_uuid <- all_org[[i-1]]$entities$properties$identifier$uuid[1000]
+    
+    # Print the last UUID for debugging
+    print(paste("Last UUID for iteration", i-1, ":", last_uuid))
+    
+    # Update the payload with the new after_id
+    payload <- paste0("{\"query\":[{\"operator_id\":\"includes\",\"type\":\"predicate\",\"field_id\":\"location_identifiers\",\"values\":[\"India\"]},{\"operator_id\":\"gte\",\"type\":\"predicate\",\"field_id\":\"founded_on\",\"values\":[\"2013\"]},{\"operator_id\":\"gte\",\"type\":\"predicate\",\"field_id\":\"num_funding_rounds\",\"values\":[1]}],\"limit\":1000,\"field_ids\":[\"legal_name\",\"identifier\",\"location_identifiers\",\"name\",\"categories\",\"category_groups\",\"description\",\"status\",\"linkedin\",\"founded_on\",\"ipo_status\",\"closed_on\",\"exited_on\",\"num_funding_rounds\",\"went_public_on\"],\"order\":[{\"sort\":\"desc\",\"field_id\":\"founded_on\"}],\"after_id\":\"", last_uuid, "\"}")
+
+    }
+  
+  # Make the POST request
+  response <- VERB("POST", url, body = payload, content_type("application/json"), accept("application/json"), encode = "json")
+  
+  # Parse the response
+  company_response <- httr::content(response, "text", encoding = "UTF-8")
+  company_data <- fromJSON(company_response)
+  
+  # Store the response in the all_org list
+  all_org[[i]] <- company_data
+  Sys.sleep(1)
+}
+
+# Save the all organization data to a JSON file
+#write_json(org_details, path = "org_details_final.json", pretty = TRUE)
+
+# Combine all the organization entities data into a single dataframe
+org_details <- bind_rows(lapply(all_org, function(x) x$entities$properties))
+
+# Unlist and extract the details from columns with nested lists
+org_details$entity <- sapply(org_details$identifier, function(x) x$permalink)
+org_details$category_keywords <- sapply(org_details$categories, function(x) paste(x$value, collapse = ", "))
+org_details$founded_on_date <- as.Date(org_details$founded_on$value)
+org_details$exited_on_date <- as.Date(org_details$exited_on$value)
+org_details$closed_on_date <- as.Date(org_details$closed_on$value)
+org_details$city <- sapply(org_details$location_identifiers, function(x) x$value[1])
+org_details$state <- sapply(org_details$location_identifiers, function(x) x$value[2])
+org_details$industry <- sapply(org_details$industry, function(x) {
+  if (!is.null(x) && length(x) > 0) {
+    return(as.character(x[[1]]))
+  } else {
+    return(NA)
+  }
+})
+
+# Load org_details from the JSON file
+org_details <- fromJSON("org_details_final.json")
+
+# Apply filters and transformations
+org_details$entity <- org_details$identifier$permalink
+org_details$uuid <- org_details$identifier$uuid
+org_details <- org_details[!duplicated(org_details$name), ]
+org_details <- org_details[is.na(org_details$description) == FALSE, ]
+org_details$founded_on_date <- as.Date(org_details$founded_on_date)
+
+
+#-------------------------------------EXTRACT HTML LINKEDIN DESCRIPTIONS----------------------------------------
+# Find the companies with NA description
+na_descriptions <- which(is.na(org_details$description) == TRUE)
+
+# Initialize linkedin_url column if it doesn't exist
+if (!"linkedin_url" %in% colnames(org_details)) {
+  org_details$linkedin_url <- NA
+}
+# Get linkedin URLs for companies with NA description
+for (i in na_descriptions) {
+  org_details$linkedin_url[i] <- ifelse(is.na(org_details[i,]$linkedin$value), NA, org_details[i,]$linkedin$value)
+}
+
+# remove the "/" backslash from the end of each linkedin URLs which has a backslash
+for (i in na_descriptions) {
+  org_details$linkedin_url[i] <- gsub("/$", "", org_details$linkedin_url[i])
+}
+
+# identify the rows with a linkedin URL
+rows_with_url <- which(!is.na(org_details$linkedin_url))
+
+# Extract the About description for each startup company from their LinkedIn URLs
+for (i in rows_with_url[51:382]) {
+  # Use tryCatch to handle errors
+  tryCatch({
+    html <- read_html(org_details$linkedin_url[i])
+    Sys.sleep(2)
+    about <- html %>% html_elements(css = "section.core-section-container:nth-child(1) > div.core-section-container__content > p") %>% html_text()
+    
+    # Check if About section is not empty before assigning
+    if (length(about) > 0) {
+      org_details$description[i] <- about
+    } else {
+      about <- html %>% html_elements(css = "div.org-about-module__description > div.ember-view > span") %>% html_text()
+      # Check if about is not empty before assigning
+      if (length(about) > 0) {
+        org_details$description[i] <- about
+      } else {
+        org_details$description[i] <- NA  # or any placeholder value
+        message("No description found for company:", org_details$name[i])
+      }
+    }
+    
+    # Introduce a time delay of 3 seconds between HTTP requests
+    Sys.sleep(3)
+  }, error = function(e) {
+    # Print the error message and the problematic index
+    message("Error at index: ", i, " with company: ", org_details$name[i], ". Error: ", e$message)
+  
+  # Introduce a time delay of 3 seconds between HTTP requests
+  Sys.sleep(2)
+})
+}
+
+linkedin_descriptions <- org_details[rows_with_url, c("name", "linkedin_url", "description")]
+
+# save the linkedin descriptions to a CSV file
+#write_csv(linkedin_descriptions, path = "linkedin_descriptions.csv")
+
+# Load the linkedin descriptions from the CSV file
+linkedin_descriptions <- read_csv("linkedin_descriptions.csv")
+
+# Find rows with NA descriptions
+na_descriptions <- org_details[which(is.na(org_details$description) == TRUE),]
+
+# Add in the linkedin descriptions to the org_details descriptions if the name matches
+for (i in 1:nrow(org_details)) {
+  if (org_details$name[i] %in% linkedin_descriptions$name) {
+    org_details$description[i] <- linkedin_descriptions$description[which(linkedin_descriptions$name == org_details$name[i])]
+  }
+}
+
+----------------------------------------# Extract Org Description Manually------------------------------------------
+# Load an xls file containing the descriptions of NA companies
+manual_descriptions <- read_xlsx("manual_descriptions_startups.xlsx")
+
+# Add manual descriptions to the org_details descriptions if the name matches
+for (i in 1:nrow(org_details)) {
+  if (org_details$name[i] %in% manual_descriptions$name) {
+    org_details$description[i] <- manual_descriptions$description[which(manual_descriptions$name == org_details$name[i])]
+  }
+}
+
+# Save org_details to a JSON file
+#write_json(org_details, path = "org_details_final_STM.json", pretty = TRUE)
+
+# ------------------------------ASSIGN SEM END/START DATES---------------------------------------
+# Assign semester start and end dates
+sem1_start_date <- as.Date("2022-01-01")
+sem1_end_date <- as.Date("2022-06-30")
+sem2_start_date <- as.Date("2021-07-01")
+sem2_end_date <- as.Date("2021-12-31")
+sem3_start_date <- as.Date("2021-01-01")
+sem3_end_date <- as.Date("2021-06-30")
+sem4_start_date <- as.Date("2020-07-01")
+sem4_end_date <- as.Date("2020-12-31")
+sem5_start_date <- as.Date("2020-01-01")
+sem5_end_date <- as.Date("2020-06-30")
+sem6_start_date <- as.Date("2019-07-01")
+sem6_end_date <- as.Date("2019-12-31")
+sem7_start_date <- as.Date("2019-01-01")
+sem7_end_date <- as.Date("2019-06-30")
+sem8_start_date <- as.Date("2018-07-01")
+sem8_end_date <- as.Date("2018-12-31")
+sem9_start_date <- as.Date("2018-01-01")
+sem9_end_date <- as.Date("2018-06-30")
+sem10_start_date <- as.Date("2017-07-01")
+sem10_end_date <- as.Date("2017-12-31")
+sem11_start_date <- as.Date("2017-01-01")
+sem11_end_date <- as.Date("2017-06-30")
+sem12_start_date <- as.Date("2016-07-01")
+sem12_end_date <- as.Date("2016-12-31")
+sem13_start_date <- as.Date("2016-01-01")
+sem13_end_date <- as.Date("2016-06-30")
+sem14_start_date <- as.Date("2015-07-01")
+sem14_end_date <- as.Date("2015-12-31")
+sem15_start_date <- as.Date("2015-01-01")
+sem15_end_date <- as.Date("2015-06-30")
+sem16_start_date <- as.Date("2014-07-01")
+sem16_end_date <- as.Date("2014-12-31")
+sem17_start_date <- as.Date("2014-01-01")
+sem17_end_date <- as.Date("2014-06-30")
+sem18_start_date <- as.Date("2013-07-01")
+sem18_end_date <- as.Date("2013-12-31")
+sem19_start_date <- as.Date("2013-01-01")
+sem19_end_date <- as.Date("2013-06-30")
+
+```
+
+
+The below code chunk extracts the funding details of the organizations from the entity search endpoint.  The code makes a GET request to the Crunchbase API, extracts the relevant data, and stores it in a JSON file for further analysis.
+
+Note: The extracted entity specific data from Crunchbase API is stored in a JSON file, that can be loaded for further analysis.
+
+```{r, entity_search}
+
+#-----------------------------------ENTITY-API-SEARCH----------------------------------------------
+# Extract the permalink of all entities
+entity_names <- org_details$identifier$permalink
+
+# Initialize an empty list to store all responses
+all_entities <- list()
+
+# Define the base URL for the entity search endpoint
+base_url <- "https://api.crunchbase.com/api/v4/entities/organizations/"
+
+# Define the loop to extract the data for each entity
+for (entity in NA_founder_entities[1:5]) {
+  entity_url <- paste0(base_url, "centriti", "?card_ids=founder_identifiers,founders,investors,participated_funding_rounds,participated_funds,participated_investments,press_references,raised_funding_rounds,raised_funds,raised_investments&field_ids=legal_name,name,went_public_on,founder_identifiers,num_founders,exited_on,status,funding_total,num_funding_rounds,last_funding_type,last_funding_at,last_funding_total,funding_round_identifier,founded_on,num_portfolio_organizations,num_founders", "&user_key=", apikey)
+  entity_response <- GET(entity_url)
+  entity_text <- httr::content(entity_response, "text", encoding = "UTF-8")
+  entity_data <- fromJSON(entity_text)
+  
+  all_entities[[entity]] <- entity_data
+  print(paste("Entity:", entity, "processed"))
+  Sys.sleep(1)
+}
+
+
+# Save the all entities data to a JSON file
+#write_json(all_entities, path = "all_entities_funding_details_2.json", pretty = TRUE)
+
+# Load the JSON file containing the all entities data
+all_entities <- fromJSON("all_entities_funding_details_2.json")
+
+
+```
+
+Below code chunk uses RSelenium to extract the 'number of founders' for startups with this info missing in the Crunchbase data, from the Inc42 database. The code navigates to the Inc42 website, searches for each startup, and extracts the number of founders from the company details page. The extracted data is stored in a list and saved to a CSV file for further analysis.
+
+```{r, NA_num_founders}
+
+# Create an automated RSelenium web scraper to extract the num of founders of few startups
+# Initialize the RSelenium server
+url<- "https://inc42.com/company"
+
+# Start the Selenium server:
+rD <- rsDriver(browser=c("firefox"), verbose = F, port = netstat::free_port(random = TRUE), chromever = NULL) 
+driver <- rD[["client"]] 
+
+# Navigate to the selected URL address
+driver$navigate(url)
+
+#wait for 1 seconds
+Sys.sleep(1)
+
+# Find the login button
+login <- driver$findElement(using = 'css selector', value = '.loggin-btn')
+
+# Click the login button
+login$clickElement()
+
+# Wait for 10 seconds to enter the password manually, one time
+Sys.sleep(10)
+
+# Initialize an empty list to store the number of founders for each startup
+num_founders_list <- list()
+
+for (startup in NA_founder_startups) {
+  # Find the search bar on the page
+  search_bar <- driver$findElement(using = 'css selector', value = '#global_search')
+  
+  # Clear the search bar before entering a new company name
+  search_bar$clearElement()
+  
+  # Enter the company name in the search bar
+  search_bar$sendKeysToElement(list(startup, key = "enter"))
+  
+  # Wait for the search results to load
+  Sys.sleep(3)
+  
+  # Click the first search option (modify the selector if necessary)
+  search_option <- driver$findElement(using = 'css selector', value = '#customSearchDropDown > div.globalSearchComponent__SearchItemRowContainer-sc-3mmbb-2.iftbWJ:nth-child(2)')
+  search_option$clickElement()
+  
+  # Wait for the company details page to load
+  Sys.sleep(2)
+  
+  # Initialize num_founders to 1 by default
+  num_founders <- 1
+  
+  # Try to find the number of founders element
+  tryCatch({
+    paytm_logo <- driver$findElement(using = 'css selector', value = '.companyDetailStyle__Heading-sc-1rlp5q9-15.knCjGJ')
+    # Get the text and check if it matches with Paytm
+    paytm_text <- paytm_logo$getElementText()
+    if (paytm_text == "Paytm") {
+      num_founders <- NA
+      message("Correct page wasn't found for", startup)
+    }
+  }, error = function(e) {
+    # If element is not found, num_founders remains 1
+  })
+  tryCatch({
+    num_founders_element <- driver$findElement(using = 'css selector', value = '.companyDetailStyle__DivAlign-sc-1rlp5q9-41.founder-items > .companyDetailStyle__LoadMoreButton-sc-1rlp5q9-39 > a')
+    num_founders_text <- num_founders_element$getElementText()
+    # Extract the number of founders from the text, digit immediately after + sign
+    num_founders <- as.numeric(str_extract(num_founders_text, "\\+(\\d+)")) + 1
+  }, error = function(e) {
+    # If element is not found, num_founders remains 1
+    message("Element not found, setting num_founders to 1 for ", startup)
+  })
+  
+  # Store the number of founders in the list
+  num_founders_list[[startup]] <- num_founders
+  
+  # Wait before the next iteration
+  Sys.sleep(1)
+}
+
+# Print the results
+print(num_founders_list)
+
+# Stop the Selenium server
+driver$close()
+rD$server$stop()
+
+# Create a dataframe from the founders list
+NA_founders_df <- data.frame(startup = names(num_founders_list), num_founders = unlist(num_founders_list), row.names = NULL)
+
+# Save the NA founders data to a CSV file
+#write_csv(NA_founders_df, path = "NA_founders.csv")
+
+```
+
+Below function processes the funding details of the organizations for each semester. The code filters the entities founded before the end of the semester, extracts the funding details and other time-series variables, such as days since last funding, number of investors, investor names, from the time-stamped funding rounds panel data, and populates the funding details data frame with relevant information.
+
+```{r, funding_details}
+#-----------------------------------POPULATING FUNDING DETAILS FOR SEMESTERS----------------------------------------------
+
+process_funding_details <- function(org_details, semester_start_date, semester_end_date) {
+  # Convert date strings to Date objects
+  semester_start_date <- as.Date(semester_start_date)
+  semester_end_date <- as.Date(semester_end_date)
+  
+  # Filter the entities founded before the end of the semester
+  sem_entities <- org_details[org_details$founded_on_date <= semester_end_date,]$identifier$permalink
+  
+  # Initialize an empty data frame to store the extracted funding details
+  funding_details_df <- data.frame(
+  name = character(),
+  legal_name = character(),
+  entity = character(),
+  funding_total = numeric(),
+  num_investors = numeric(),
+  funding_round_type = character(),
+  investor_names = character(),
+  investor_permalink = character(),
+  funding_date = as.Date(character()),
+  num_funding_rounds = numeric(),
+  uuid = character(),
+  num_founders = numeric(),
+  num_prev_startups = numeric(),
+  last_round_funding = numeric(),
+  days_since_founded = numeric(),
+  days_since_last_funding = numeric(),
+  num_articles = numeric(),
+  female_founder = logical(),
+  prop_female_founders = numeric(),
+  status = character(),
+  stringsAsFactors = FALSE)
+  
+  # Initialize a list to keep track of skipped entities
+  skipped_entities <- c()
+  
+  for (entity in sem_entities) {
+    funding_rounds <- all_entities[[entity]]$cards$raised_funding_rounds
+    # Check if funding_rounds is NULL or not a data frame
+    if (is.null(funding_rounds) || !is.data.frame(funding_rounds)) {
+      skipped_entities <- c(skipped_entities, entity)
+      next
+    }
+    
+    funding_rounds$announced_on <- as.Date(funding_rounds$announced_on)
+    filtered_rounds <- funding_rounds[which(funding_rounds$announced_on <= semester_end_date & funding_rounds$is_equity == "TRUE"), ]
+    if (nrow(filtered_rounds) == 0) {
+      # If there are no equity funding rounds, skip to the next entity
+      next
+    }
+    
+    name <- all_entities[[entity]]$properties$name
+    legal_name <- ifelse(!is.null(all_entities[[entity]]$properties$legal_name), all_entities[[entity]]$properties$legal_name, NA)
+    status <- all_entities[[entity]]$properties$status
+    # funding_amount must not be 0
+    funding_amount <- sum(filtered_rounds$money_raised$value_usd, na.rm = TRUE)
+    if (funding_amount == 0) {
+      skipped_entities <- c(skipped_entities, entity)
+      next
+    }
+    num_funding_rounds <- nrow(filtered_rounds)
+    num_investors <- sum(filtered_rounds$num_investors, na.rm = TRUE)
+    funding_round_type <- ifelse(length(filtered_rounds$investment_type) > 0, filtered_rounds$investment_type[1], NA)
+    funding_date <- ifelse(length(filtered_rounds$announced_on) > 0, as.Date(filtered_rounds$announced_on[1]), NA)
+                           
+    investor_details <- filtered_rounds$investor_identifiers
+    if (is.null(investor_details) || length(investor_details) == 0 || (is.list(investor_details) && length(investor_details) == 1 && length(investor_details[[1]]) == 0)) {
+      skipped_entities <- c(skipped_entities, entity)
+      next
+    } else {
+      investor_names <- paste(unlist(lapply(investor_details, function(investor) investor$value)), collapse = ", ")
+      investor_permalink <- paste(unlist(lapply(investor_details, function(investor) investor$permalink)), collapse = ", ")
+    }
+    
+    uuid <- all_entities[[entity]]$properties$identifier$uuid
+    if (is.null(all_entities[[entity]]$cards$founders) || length(all_entities[[entity]]$cards$founders) == 0) {
+      num_founders <- NA
+    } else {
+      num_founders <- nrow(all_entities[[entity]]$cards$founders)
+    }
+  
+    founder_details <- all_entities[[entity]]$cards$founders
+    # find the proportion of female founders in the team
+    if (!is.null(founder_details) && length(founder_details) > 0) {
+  # Check if any of the founders' gender is "female"
+    female_founder <- any(founder_details$gender == "female", na.rm = TRUE)
+    
+    if (female_founder) {
+      # Calculate the proportion of female founders
+      prop_female_founders <- sum(founder_details$gender == "female", na.rm = TRUE) / nrow(founder_details)
+    } else {
+      prop_female_founders <- NA
+    }
+  } else {
+    female_founder <- FALSE
+    prop_female_founders <- NA
+  }
+    num_prev_startups <- ifelse(!is.null(all_entities[[entity]]$cards$founders$num_founded_organizations),
+                                max(all_entities[[entity]]$cards$founders$num_founded_organizations, na.rm = TRUE),
+                                NA)
+    last_round_funding <- ifelse(length(filtered_rounds$money_raised$value_usd) > 0, filtered_rounds$money_raised$value_usd[1], NA)
+    
+    last_funding_date <- ifelse(nrow(filtered_rounds) > 1, as.Date(filtered_rounds$announced_on[2]), NA)
+    
+    founded_on <- ifelse(!is.null(all_entities[[entity]]$properties$founded_on$value), 
+                         as.Date(all_entities[[entity]]$properties$founded_on$value), NA)
+    days_since_founded <- ifelse(!is.na(funding_date) && !is.na(founded_on),
+                                 as.numeric(funding_date - founded_on), 
+                                 NA)
+    days_since_last_funding <- ifelse(!is.na(last_funding_date),
+                                      as.numeric(funding_date - last_funding_date), 
+                                      NA)
+    
+    # Extract data for news articles
+    if (is.null(all_entities[[entity]]$cards$press_references) || length(all_entities[[entity]]$cards$press_references) == 0) {
+      num_articles <- 0
+    } else {
+      # Count only the news articles up to semester end date
+      filtered_articles <- all_entities[[entity]]$cards$press_references[which(as.Date(all_entities[[entity]]$cards$press_references$posted_on) <= semester_end_date), ]
+      num_articles <- nrow(filtered_articles)
+    }
+    
+    # Create a dataframe row for current entity and with the extracted details as columns
+    entity_details <- data.frame(
+      name = name,
+      legal_name = legal_name,
+      entity = entity,
+      funding_total = funding_amount,
+      num_investors = num_investors,
+      funding_round_type = funding_round_type,
+      investor_names = investor_names,
+      investor_permalink = investor_permalink,
+      funding_date = as.Date(funding_date),
+      num_funding_rounds = num_funding_rounds,
+      uuid = uuid,
+      num_founders = num_founders,
+      female_founder = female_founder,
+      prop_female_founders = prop_female_founders,
+      num_prev_startups = num_prev_startups,
+      last_round_funding = last_round_funding,
+      days_since_founded = days_since_founded,
+      days_since_last_funding = days_since_last_funding,
+      num_articles = num_articles,
+      status = status,
+      stringsAsFactors = FALSE
+    )
+    
+    funding_details_df <- rbind(funding_details_df, entity_details)
+  }
+  
+  # Filter out entities with no funding rounds in the semester
+  sem_startup_df <- funding_details_df %>% filter(funding_date >= semester_start_date)
+  
+  return(list(sem_startup_df = sem_startup_df, funding_details_df = funding_details_df))
+}
+    
+sem1_startup_df <- process_funding_details(org_details, "2022-01-01", "2022-06-30")$sem_startup_df
+sem1_funding_details_df <- process_funding_details(org_details, "2022-01-01", "2022-06-30")$funding_details_df
+
+#-------------------------------
+
+sem2_startup_df <- process_funding_details(org_details, "2021-07-01", "2021-12-31")$sem_startup_df
+sem2_funding_details_df <- process_funding_details(org_details, "2021-07-01", "2021-12-31")$funding_details_df
+
+#-------------------------------
+
+sem3_startup_df <- process_funding_details(org_details, "2021-01-01", "2021-06-30")$sem_startup_df
+sem3_funding_details_df <- process_funding_details(org_details, "2021-01-01", "2021-06-30")$funding_details_df
+
+#-------------------------------
+
+sem4_startup_df <- process_funding_details(org_details, "2020-07-01", "2020-12-31")$sem_startup_df
+sem4_funding_details_df <- process_funding_details(org_details, "2020-07-01", "2020-12-31")$funding_details_df
+
+#-------------------------------
+
+sem5_startup_df <- process_funding_details(org_details, "2020-01-01", "2020-06-30")$sem_startup_df
+sem5_funding_details_df <- process_funding_details(org_details, "2020-01-01", "2020-06-30")$funding_details_df
+
+#-------------------------------
+
+sem6_startup_df <- process_funding_details(org_details, sem6_start_date, sem6_end_date)$sem_startup_df
+sem6_funding_details_df <- process_funding_details(org_details, sem6_start_date, sem6_end_date)$funding_details_df
+
+#-------------------------------
+sem7_startup_df <- process_funding_details(org_details, sem7_start_date, sem7_end_date)$sem_startup_df
+sem7_funding_details_df <- process_funding_details(org_details, sem7_start_date, sem7_end_date)$funding_details_df
+
+#-------------------------------
+sem8_startup_df <- process_funding_details(org_details, sem8_start_date, sem8_end_date)$sem_startup_df
+sem8_funding_details_df <- process_funding_details(org_details, sem8_start_date, sem8_end_date)$funding_details_df
+
+#-------------------------------
+sem9_startup_df <- process_funding_details(org_details, sem9_start_date, sem9_end_date)$sem_startup_df
+sem9_funding_details_df <- process_funding_details(org_details, sem9_start_date, sem9_end_date)$funding_details_df
+
+#-------------------------------
+sem10_startup_df <- process_funding_details(org_details, sem10_start_date, sem10_end_date)$sem_startup_df
+sem10_funding_details_df <- process_funding_details(org_details, sem10_start_date, sem10_end_date)$funding_details_df
+
+#-------------------------------
+sem11_startup_df <- process_funding_details(org_details, sem11_start_date, sem11_end_date)$sem_startup_df
+sem11_funding_details_df <- process_funding_details(org_details, sem11_start_date, sem11_end_date)$funding_details_df
+
+#-------------------------------
+sem12_startup_df <- process_funding_details(org_details, sem12_start_date, sem12_end_date)$sem_startup_df
+sem12_funding_details_df <- process_funding_details(org_details, sem12_start_date, sem12_end_date)$funding_details_df
+
+#-------------------------------
+sem13_startup_df <- process_funding_details(org_details, sem13_start_date, sem13_end_date)$sem_startup_df
+sem13_funding_details_df <- process_funding_details(org_details, sem13_start_date, sem13_end_date)$funding_details_df
+
+#-------------------------------
+sem14_startup_df <- process_funding_details(org_details, sem14_start_date, sem14_end_date)$sem_startup_df
+sem14_funding_details_df <- process_funding_details(org_details, sem14_start_date, sem14_end_date)$funding_details_df
+
+#-------------------------------
+sem15_startup_df <- process_funding_details(org_details, sem15_start_date, sem15_end_date)$sem_startup_df
+sem15_funding_details_df <- process_funding_details(org_details, sem15_start_date, sem15_end_date)$funding_details_df
+
+#-------------------------------
+sem16_startup_df <- process_funding_details(org_details, sem16_start_date, sem16_end_date)$sem_startup_df
+sem16_funding_details_df <- process_funding_details(org_details, sem16_start_date, sem16_end_date)$funding_details_df
+
+#-------------------------------
+sem17_startup_df <- process_funding_details(org_details, sem17_start_date, sem17_end_date)$sem_startup_df
+sem17_funding_details_df <- process_funding_details(org_details, sem17_start_date, sem17_end_date)$funding_details_df
+
+#-------------------------------
+sem18_startup_df <- process_funding_details(org_details, sem18_start_date, sem18_end_date)$sem_startup_df
+sem18_funding_details_df <- process_funding_details(org_details, sem18_start_date, sem18_end_date)$funding_details_df
+
+#-------------------------------
+sem19_startup_df <- process_funding_details(org_details, sem19_start_date, sem19_end_date)$sem_startup_df
+sem19_funding_details_df <- process_funding_details(org_details, sem19_start_date, sem19_end_date)$funding_details_df
+
+```
+
+
+Below code chunk filters the organizations that have been successful in terms of IPO or acquisition or securing funding in the following 2 years from the end of semesters. 
+
+```{r, funding_success_exits}
+
+# Filter the organizations that have been successful in terms of IPO or acquisition
+org_details_ipo_acq_df <- org_details[org_details$status == c("ipo", "was_acquired"),]
+
+# change dates to Date format
+org_details_ipo_acq_df$exited_on_date <- as.Date(org_details_ipo_acq_df$exited_on_date)
+org_details_ipo_acq_df$closed_on_date <- as.Date(org_details_ipo_acq_df$closed_on_date)
+
+
+# Define the function to filter successful startups in terms of IPO and acquisition
+filter_ipo_acquisitions <- function(sem_df, org_details_df, sem_end_date) {
+  # Initialize an empty data frame to store the results
+  sem_ipo_acq_success_df <- data.frame()
+  
+  # Get the list of entities
+  sem_entities <- sem_df$entity
+  
+  # Loop through each entity
+  for (entity in sem_entities) {
+    if (entity %in% org_details_df$entity) {
+      # Check if the exited_on_date is two years from the semester end date of the entity in sem_df
+      funding_date <- sem_end_date
+      exited_on_date <- org_details_df[org_details_df$entity == entity,]$exited_on_date
+      
+      if (abs(difftime(exited_on_date, funding_date, units = "weeks")) <= 104 & exited_on_date > funding_date) {
+        print(paste("Entity:", entity, "is a successful startup"))
+        
+        # Retrieve the status for the entity
+        status <- org_details_df[org_details_df$entity == entity,]$status
+        
+        # Create a new row with the entity's details
+        new_row <- data.frame(
+          entity = entity,
+          status = status,
+          exited_on_date = exited_on_date,
+          funding_success = 1
+        )
+        
+        # Append the new row to the result data frame
+        sem_ipo_acq_success_df <- rbind(sem_ipo_acq_success_df, new_row)
+      }
+    }
+  }
+  
+  return(sem_ipo_acq_success_df)
+}
+
+sem1_ipo_acq_df <- filter_ipo_acquisitions(sem1_startup_df, org_details_ipo_acq_df, sem1_end_date)
+sem2_ipo_acq_df <- filter_ipo_acquisitions(sem2_startup_df, org_details_ipo_acq_df, sem2_end_date)
+sem3_ipo_acq_df <- filter_ipo_acquisitions(sem3_startup_df, org_details_ipo_acq_df, sem3_end_date)
+sem4_ipo_acq_df <- filter_ipo_acquisitions(sem4_startup_df, org_details_ipo_acq_df, sem4_end_date)
+sem5_ipo_acq_df <- filter_ipo_acquisitions(sem5_startup_df, org_details_ipo_acq_df, sem5_end_date)
+sem6_ipo_acq_df <- filter_ipo_acquisitions(sem6_startup_df, org_details_ipo_acq_df, sem6_end_date)
+sem7_ipo_acq_df <- filter_ipo_acquisitions(sem7_startup_df, org_details_ipo_acq_df, sem7_end_date)
+sem8_ipo_acq_df <- filter_ipo_acquisitions(sem8_startup_df, org_details_ipo_acq_df, sem8_end_date)
+sem9_ipo_acq_df <- filter_ipo_acquisitions(sem9_startup_df, org_details_ipo_acq_df, sem9_end_date)
+sem10_ipo_acq_df <- filter_ipo_acquisitions(sem10_startup_df, org_details_ipo_acq_df, sem10_end_date)
+sem11_ipo_acq_df <- filter_ipo_acquisitions(sem11_startup_df, org_details_ipo_acq_df, sem11_end_date)
+sem12_ipo_acq_df <- filter_ipo_acquisitions(sem12_startup_df, org_details_ipo_acq_df, sem12_end_date)
+sem13_ipo_acq_df <- filter_ipo_acquisitions(sem13_startup_df, org_details_ipo_acq_df, sem13_end_date)
+sem14_ipo_acq_df <- filter_ipo_acquisitions(sem14_startup_df, org_details_ipo_acq_df, sem14_end_date)
+sem15_ipo_acq_df <- filter_ipo_acquisitions(sem15_startup_df, org_details_ipo_acq_df, sem15_end_date)
+sem16_ipo_acq_df <- filter_ipo_acquisitions(sem16_startup_df, org_details_ipo_acq_df, sem16_end_date)
+sem17_ipo_acq_df <- filter_ipo_acquisitions(sem17_startup_df, org_details_ipo_acq_df, sem17_end_date)
+sem18_ipo_acq_df <- filter_ipo_acquisitions(sem18_startup_df, org_details_ipo_acq_df, sem18_end_date)
+sem19_ipo_acq_df <- filter_ipo_acquisitions(sem19_startup_df, org_details_ipo_acq_df, sem19_end_date)
+
+```
+
+```{r, funding_success}
+
+#------------------------------------FIND FUNDING SUCCESS STARTUPS--------------------------------------------------
+
+find_successful_funding <- function(sem_startup_df, sem_end_date) {
+  # Extract the names of entities with funding rounds in the semester
+  sem_startup_names <- sem_startup_df$entity
+  sem_end_date <- as.Date(sem_end_date)
+  
+  # Initialize an empty list to store failed entities
+  failed_entities <- c()
+  # Initialize an empty data frame to store the funding details for successful entities
+  funding_success_df <- data.frame()
+  
+  for (entity in sem_startup_names) {
+    tryCatch({
+      funding_details <- all_entities[[entity]]$cards$raised_funding_rounds
+      
+      # Convert the announced_on date to Date format
+      funding_details$announced_on <- as.Date(funding_details$announced_on)
+      
+      # Filter funding rounds within the date range and with is_equity TRUE
+      funding_rounds <- funding_details[which(
+        difftime(funding_details$announced_on, sem_end_date, units = "weeks") <= 104 & 
+        funding_details$announced_on > sem_end_date &                                          
+        funding_details$is_equity == TRUE),]
+                    
+      if (nrow(funding_rounds) == 0) {
+        # If there are no funding rounds in the semester, store the entity name and skip to the next entity
+        failed_entities <- c(failed_entities, entity)
+        next
+      } else {
+        if (nrow(funding_rounds) > 1) {
+          # Select the most recent funding round if there are multiple rounds
+          funding_rounds <- funding_rounds[order(funding_rounds$announced_on, decreasing = TRUE), ]
+          funding_rounds <- funding_rounds[1, ]
+        }
+        # Filter and keep only the relevant columns
+        required_columns <- c("announced_on", "investment_type", "money_raised", "num_investors", "identifier", "short_description")
+        
+        missing_columns <- setdiff(required_columns, colnames(funding_rounds))
+        for (col in missing_columns) {
+          funding_rounds[[col]] <- NA
+        }
+        
+        # Ensure the order of columns and convert to data frame
+        funding_rounds <- funding_rounds[, required_columns, drop = FALSE]
+        
+        # Create a temporary data frame for the current entity
+        funding_success_entity_df <- data.frame(
+          entity = entity, 
+          announced_on = funding_rounds$announced_on, 
+          funding_total = ifelse(!is.na(funding_rounds$money_raised), funding_rounds$money_raised$value_usd, NA), 
+          num_investors = funding_rounds$num_investors, 
+          funding_round_type = funding_rounds$investment_type,
+          stringsAsFactors = FALSE
+        )
+        
+        # Combine the funding rounds data/rows in a common dataframe
+        funding_success_df <- bind_rows(funding_success_df, funding_success_entity_df)
+      }
+    }, error = function(e) {
+      message(paste("Error processing entity:", entity, "-", e$message))
+      failed_entities <- c(failed_entities, entity)
+    })
+  }
+  
+  return(list(funding_success_df = funding_success_df, failed_entities = failed_entities))
+}
+
+# Process the successful funding startups for each semester
+sem1_funding_success <- find_successful_funding(sem1_startup_df, "2022-06-30")
+
+sem1_funding_success_df <- sem1_funding_success$funding_success_df
+sem1_failed_entities_df <- sem1_funding_success$failed_entities
+
+#---------------------------------------------------------------------------------
+sem2_funding_success <- find_successful_funding(sem2_startup_df, "2021-12-31")
+sem2_funding_success_df <- sem2_funding_success$funding_success_df
+sem2_failed_entities_df <- sem2_funding_success$failed_entities
+
+#---------------------------------------------------------------------------------
+sem3_funding_success <- find_successful_funding(sem3_startup_df, "2021-06-30")
+sem3_funding_success_df <- sem3_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem4_funding_success <- find_successful_funding(sem4_startup_df, "2020-12-31")
+sem4_funding_success_df <- sem4_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem5_funding_success <- find_successful_funding(sem5_startup_df, "2020-06-30")
+sem5_funding_success_df <- sem5_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem6_funding_success <- find_successful_funding(sem6_startup_df, sem6_end_date)
+sem6_funding_success_df <- sem6_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem7_funding_success <- find_successful_funding(sem7_startup_df, sem7_end_date)
+sem7_funding_success_df <- sem7_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem8_funding_success <- find_successful_funding(sem8_startup_df, sem8_end_date)
+sem8_funding_success_df <- sem8_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem9_funding_success <- find_successful_funding(sem9_startup_df, sem9_end_date)
+sem9_funding_success_df <- sem9_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem10_funding_success <- find_successful_funding(sem10_startup_df, sem10_end_date)
+sem10_funding_success_df <- sem10_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem11_funding_success <- find_successful_funding(sem11_startup_df, sem11_end_date)
+sem11_funding_success_df <- sem11_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem12_funding_success <- find_successful_funding(sem12_startup_df, sem12_end_date)
+sem12_funding_success_df <- sem12_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem13_funding_success <- find_successful_funding(sem13_startup_df, sem13_end_date)
+sem13_funding_success_df <- sem13_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem14_funding_success <- find_successful_funding(sem14_startup_df, sem14_end_date)
+sem14_funding_success_df <- sem14_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem15_funding_success <- find_successful_funding(sem15_startup_df, sem15_end_date)
+sem15_funding_success_df <- sem15_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem16_funding_success <- find_successful_funding(sem16_startup_df, sem16_end_date)
+sem16_funding_success_df <- sem16_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem17_funding_success <- find_successful_funding(sem17_startup_df, sem17_end_date)
+sem17_funding_success_df <- sem17_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem18_funding_success <- find_successful_funding(sem18_startup_df, sem18_end_date)
+sem18_funding_success_df <- sem18_funding_success$funding_success_df
+
+#---------------------------------------------------------------------------------
+sem19_funding_success <- find_successful_funding(sem19_startup_df, sem19_end_date)
+sem19_funding_success_df <- sem19_funding_success$funding_success_df
+
+```
+
+
+Below code chunk defines function to find the doc embeddings of startup descriptions and calculate cosine similarity matrix. The similarity matrix is then used to find the competitors of the startups. 
+
+Note: The final cosine similarity matrix is obtained from the sentence embeddings obtained from Universal Sentence Encoder in Python. The cosine similarity matrix is just loaded in as csv file in R for further analysis.
+```{r, competitors}
+
+#-----------------------------------DOC2VEC FUNCTION----------------------------------------------
+
+# Function to find doc embeddings of startup descriptions 
+process_organization_descriptions <- function(date_threshold, org_details) {
+  org_descriptions <- org_details[!is.na(org_details$description), c("name", "description", "founded_on_date")]
+  
+  org_descriptions <- org_descriptions[which(org_descriptions$founded_on_date < date_threshold), ]
+  
+  org_descriptions$name <- gsub(" ", "_", org_descriptions$name)
+  
+  data <- data.frame(doc_id = org_descriptions$name, text = org_descriptions$description, stringsAsFactors = FALSE)
+  
+  # Clean the text
+  data$text <- tolower(data$text)
+  data$text <- gsub("http\\S+\\s*", "", data$text)
+  data$text <- gsub("www\\S+\\s*", "", data$text)
+  data$text <- gsub("\\S+@\\S+\\s*", "", data$text)
+  data$text <- gsub("[^[:alnum:][:space:]]", " ", data$text)
+  data$text <- gsub("\\s+", " ", data$text)
+  data$text <- gsub("\\n", " ", data$text)
+  data$text <- gsub("\\b\\d+\\b", "", data$text)
+  # Remove domain specific stopwords
+  domain_stopwords <- c("service", "product", "company", "business", "organization", "platform", "solution", "industry", "customer", "team", "market", "users", "provide", "provides", "aims", "providing", "make", "system", "revolutionize", "leading", "trusted", "pioneer", "convenience", "clients", "innovative", "india", "help", "innovation", "founded", "world", "needs", "revolutionize", "products", "can", "india's", "future", "services", "solutions", "headquartered", "people", "brand", "believe", "offers", 'app', "mission", "vision", "problems", "solve", "cutting-edge", "growth", "expertise", "commitment", "achieve", "karnataka", "bangalore", "delhi", "chennai", "mumbai", "bengaluru")
+  
+  all_stopwords <- c(stopwords("en"))
+                        
+  data$text <- removeWords(data$text, all_stopwords)
+  
+  data$nwords <- txt_count(data$text, pattern = " ")
+  #data <- subset(data, nwords < 1000 & nwords > 7)
+  
+  d2v <- paragraph2vec(data, type = "PV-DBOW", dim = 120, iter = 40, min_count = 10, threads = 6, lr = 0.04) 
+  
+  w_embedding <- as.matrix(d2v, which = "words")
+  doc_embeddings <- as.matrix(d2v, which = "docs")
+  d_vocab <- summary(d2v, which = "docs")
+  w_vocab <- summary(d2v, which = "words")
+  
+  distance_matrix <- dist(doc_embeddings, method = "euclidean")
+  hc <- hclust(distance_matrix, method = "ward.D2")
+  clusters <- cutree(hc, k = 21) # Adjust k as needed
+  
+  return(list(w_embedding = w_embedding, doc_embeddings = doc_embeddings, d_vocab = d_vocab, w_vocab = w_vocab, clusters = clusters))
+}
+
+d2v_results <- process_organization_descriptions("2022-06-01", org_details)
+
+doc_embeddings <- d2v_results$doc_embeddings
+
+#-----------------------------------COSINE-SIMILARITY----------------------------------------------
+# Function to calculate cosine similarity
+calculate_cosine_similarity_matrix <- function(doc_embeddings) {
+  # Function to calculate cosine similarity
+  cosine_similarity <- function(A, B) {
+    sim <- sum(A * B) / (sqrt(sum(A^2)) * sqrt(sum(B^2)))
+    return(sim)
+  }
+  
+  # Calculate the cosine similarity matrix
+  cosine_sim_matrix <- matrix(0, nrow = nrow(doc_embeddings), ncol = nrow(doc_embeddings))
+  
+  for (i in 1:nrow(doc_embeddings)) {
+    for (j in 1:nrow(doc_embeddings)) {
+      cosine_sim_matrix[i, j] <- cosine_similarity(doc_embeddings[i,], doc_embeddings[j,])
+    }
+  }
+  
+  # Set diagonal to 0 to ignore self-similarity in competitor search
+  diag(cosine_sim_matrix) <- 0
+  
+  rownames(cosine_sim_matrix) <- rownames(doc_embeddings)
+  colnames(cosine_sim_matrix) <- rownames(doc_embeddings)
+  
+  return(cosine_sim_matrix)
+}
+#----------------------------------------------------------Load USE similarity matrix-------------------------------------------
+# Load the USE similarity matrix from the CSV file
+USE_similarity_matrix <- read.csv("similarity_matrix.csv", row.names = 1)
+
+# Convert it into matrix
+cosine_sim_matrix <- as.matrix(USE_similarity_matrix)
+# Map colnames and rownames
+colnames(cosine_sim_matrix) <- rownames(cosine_sim_matrix)
+# Make diagnols ) to ignore self-similarity
+diag(cosine_sim_matrix) <- 0
+
+
+#-----------------------------------------POPULATE COMPETITOR DETAILS------------------------------------
+find_competitors_by_name <- function(company_name, sim_matrix, threshold = 0.5) {
+  if (!(company_name %in% rownames(sim_matrix))) {
+    stop("Invalid company name")
+  }
+  competitors <- which(sim_matrix[company_name, ] > threshold)
+  competitor_names <- names(competitors)
+  competitor_count <- length(competitor_names)
+  return(list(competitor_names = competitor_names, competitor_count = competitor_count))
+}
+
+# Define function to only identify valid competitors for each company
+# which have a similarity threshold greater than 0.5
+# Which are founded before the date of prediction (sem end date)
+# And are still operating till the date of prediction (sem end date)
+find_competitors_and_details <- function(sem_end_date, org_details, funding_details_df, cosine_sim_matrix, threshold = 0.5) {
+  # Filter companies founded before the semester end date and are operating
+  companies_before_sem_end <- org_details[which(org_details$founded_on_date < sem_end_date & org_details$status == "operating"), c("name", "founded_on_date")]
+  
+  # Initialize competitor_df data frame
+  competitor_df <- data.frame(
+    company = character(),
+    competitor = character(),
+    competitor_count = numeric(),
+    avg_comp_funding = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Get the names of companies with funding rounds in the semester
+  sem_company_names <- funding_details_df$name
+  #sem_company_names <- gsub(" ", "_", funding_details_df$name)
+  sem_company_names <- unique(sem_company_names)
+  
+  # Identity valid competitors for each company, those who started operations before the semester end date
+  for (company in sem_company_names) {
+    tryCatch({
+      competitors <- find_competitors_by_name(company, cosine_sim_matrix, threshold)
+      if (competitors$competitor_count == 0) {
+        competitors <- find_competitors_by_name(company, cosine_sim_matrix, 0.4)
+      }
+      valid_competitors <- intersect(competitors$competitor_names, companies_before_sem_end$name)
+      count <- length(valid_competitors)
+      
+      competitor_details <- data.frame(
+        company = company,
+        competitor = ifelse(count > 0, paste(valid_competitors, collapse = ", "), NA),
+        competitor_count = ifelse(count > 0, count, 0),
+        stringsAsFactors = FALSE
+      )
+      
+      competitor_df <- rbind(competitor_df, competitor_details)
+    }, error = function(e) {
+      message("Error at company: ", company, ". Error: ", e$message)
+    })
+  }
+  
+  # Reformat the company names
+  #competitor_df$company <- gsub("_", " ", competitor_df$company)
+  
+  # Initialize competitor_details_df
+  competitor_details_df <- data.frame(
+    name = character(),
+    comp_funding_total = numeric(),
+    comp_last_round_funding = numeric(),
+    competitors = character(),
+    count = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Calculate funding details for each company, over the competitors
+  for (company in competitor_df$company) {
+    comp_funding_total <- 0
+    comp_last_round_funding <- 0
+    num_comp_raised_funds <- 0
+    
+    competitors <- competitor_df[which(competitor_df$company == company),]$competitor
+    if (is.na(competitors) || competitors == "") next
+    
+    competitors_list <- strsplit(competitors, ", ")[[1]]
+    #competitors_list <- gsub("_", " ", competitors_list) %>% str_trim()
+    
+    # Initialize comp_funding_last_1year for each company
+    comp_funding_last_1year <- 0
+    
+    for (competitor in competitors_list) {
+      entity <- org_details[which(org_details$name == competitor), ]$identifier$permalink
+      # Check if entity is null or of length == 0 
+      if (is.null(entity) || length(entity) == 0) {
+        cat("Entity not found in org_details:", competitor, "\n")
+        next
+      }
+      
+      # Debugging statement: Check if entity exists in all_entities
+      if (!entity %in% names(all_entities)) {
+        cat("Entity not found in all_entities:", entity, "\n")
+        next
+      }
+      
+      # Find the funding details of the entity from all_entities
+      entity_funding_details <- all_entities[[entity]]$cards$raised_funding_rounds
+      
+      entity_funding_details$announced_on <- as.Date(entity_funding_details$announced_on, format = "%Y-%m-%d")
+      
+      # Filter funding rounds within 2 years prior to the semester end date, not after
+      entity_funding <- entity_funding_details[which(
+        abs(difftime(entity_funding_details$announced_on, sem_end_date, units = "weeks")) <= 52 & 
+        entity_funding_details$announced_on < sem_end_date),]
+      if (nrow(entity_funding) > 0) {
+        num_comp_raised_funds <- num_comp_raised_funds + 1
+        # Sum up the funding values of the filtered funding rounds
+        comp_last_round_funding <- comp_last_round_funding + sum(entity_funding$money_raised$value_usd, na.rm = TRUE)
+      }
+      if (nrow(entity_funding) == 0) {
+        #print(paste("No funding rounds found for", competitor, "in the last 1 year"))
+        next
+      }
+    }
+    
+    competitor_details <- data.frame(
+      name = company,
+      comp_funding_last_1year = comp_last_round_funding,
+      num_comp_raised_funds = num_comp_raised_funds,
+      competitors = competitors,
+      count = length(competitors_list),
+      avg_comp_funding = ifelse(length(competitors_list) > 0, comp_last_round_funding / length(competitors_list), 0),
+      prop_comp_raised_funds = ifelse(length(competitors_list) > 0, num_comp_raised_funds / length(competitors_list), 0),
+      stringsAsFactors = FALSE
+    )
+    
+    competitor_details_df <- rbind(competitor_details_df, competitor_details)
+  }
+  
+  return(list(competitor_df = competitor_df, competitor_details_df = competitor_details_df))
+}
+
+# Process the relevant competitors for each semester
+sem1_comp_result <- find_competitors_and_details(sem_end_date = as.Date("2022-06-30"), org_details = org_details, funding_details_df = sem1_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem1_competitor_df <- sem1_comp_result$competitor_df
+sem1_competitor_details_df <- sem1_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem2_comp_result <- find_competitors_and_details(sem_end_date = as.Date("2021-12-31"), org_details = org_details, funding_details_df = sem2_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem2_competitor_df <- sem2_comp_result$competitor_df
+sem2_competitor_details_df <- sem2_comp_result$competitor_details_df
+# Create a new col with the prop of comp that raised funds
+sem2_competitor_details_df$prop_comp_raised_funds <- sem2_competitor_details_df$num_comp_raised_funds / sem2_competitor_details_df$count
+
+# ---------------------------------------------------------------------------------------------
+sem3_comp_result <- find_competitors_and_details(sem_end_date = as.Date("2021-06-30"), org_details = org_details, funding_details_df = sem3_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem3_competitor_df <- sem3_comp_result$competitor_df
+sem3_competitor_details_df <- sem3_comp_result$competitor_details_df
+# Create a new col with the prop of comp that raised funds
+
+# ---------------------------------------------------------------------------------------------
+sem4_comp_result <- find_competitors_and_details(sem_end_date = as.Date("2020-12-31"), org_details = org_details, funding_details_df = sem4_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem4_competitor_df <- sem4_comp_result$competitor_df
+sem4_competitor_details_df <- sem4_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem5_comp_result <- find_competitors_and_details(sem_end_date = as.Date("2020-06-30"), org_details = org_details, funding_details_df = sem5_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem5_competitor_df <- sem5_comp_result$competitor_df
+sem5_competitor_details_df <- sem5_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem6_comp_result <- find_competitors_and_details(sem_end_date = sem6_end_date, org_details = org_details, funding_details_df = sem6_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem6_competitor_df <- sem6_comp_result$competitor_df
+sem6_competitor_details_df <- sem6_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem7_comp_result <- find_competitors_and_details(sem_end_date = sem7_end_date, org_details = org_details, funding_details_df = sem7_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem7_competitor_df <- sem7_comp_result$competitor_df
+sem7_competitor_details_df <- sem7_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem8_comp_result <- find_competitors_and_details(sem_end_date = sem8_end_date, org_details = org_details, funding_details_df = sem8_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem8_competitor_df <- sem8_comp_result$competitor_df
+sem8_competitor_details_df <- sem8_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem9_comp_result <- find_competitors_and_details(sem_end_date = sem9_end_date, org_details = org_details, funding_details_df = sem9_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem9_competitor_df <- sem9_comp_result$competitor_df
+sem9_competitor_details_df <- sem9_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem10_comp_result <- find_competitors_and_details(sem_end_date = sem10_end_date, org_details = org_details, funding_details_df = sem10_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem10_competitor_df <- sem10_comp_result$competitor_df
+sem10_competitor_details_df <- sem10_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem11_comp_result <- find_competitors_and_details(sem_end_date = sem11_end_date, org_details = org_details, funding_details_df = sem11_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem11_competitor_df <- sem11_comp_result$competitor_df
+sem11_competitor_details_df <- sem11_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem12_comp_result <- find_competitors_and_details(sem_end_date = sem12_end_date, org_details = org_details, funding_details_df = sem12_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem12_competitor_df <- sem12_comp_result$competitor_df
+sem12_competitor_details_df <- sem12_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem13_comp_result <- find_competitors_and_details(sem_end_date = sem13_end_date, org_details = org_details, funding_details_df = sem13_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem13_competitor_df <- sem13_comp_result$competitor_df
+sem13_competitor_details_df <- sem13_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem14_comp_result <- find_competitors_and_details(sem_end_date = sem14_end_date, org_details = org_details, funding_details_df = sem14_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem14_competitor_df <- sem14_comp_result$competitor_df
+sem14_competitor_details_df <- sem14_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem15_comp_result <- find_competitors_and_details(sem_end_date = sem15_end_date, org_details = org_details, funding_details_df = sem15_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem15_competitor_df <- sem15_comp_result$competitor_df
+sem15_competitor_details_df <- sem15_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem16_comp_result <- find_competitors_and_details(sem_end_date = sem16_end_date, org_details = org_details, funding_details_df = sem16_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem16_competitor_df <- sem16_comp_result$competitor_df
+sem16_competitor_details_df <- sem16_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem17_comp_result <- find_competitors_and_details(sem_end_date = sem17_end_date, org_details = org_details, funding_details_df = sem17_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem17_competitor_df <- sem17_comp_result$competitor_df
+sem17_competitor_details_df <- sem17_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem18_comp_result <- find_competitors_and_details(sem_end_date = sem18_end_date, org_details = org_details, funding_details_df = sem18_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem18_competitor_df <- sem18_comp_result$competitor_df
+sem18_competitor_details_df <- sem18_comp_result$competitor_details_df
+
+# ---------------------------------------------------------------------------------------------
+sem19_comp_result <- find_competitors_and_details(sem_end_date = sem19_end_date, org_details = org_details, funding_details_df = sem19_funding_details_df, cosine_sim_matrix = cosine_sim_matrix, threshold = 0.5)
+sem19_competitor_df <- sem19_comp_result$competitor_df
+sem19_competitor_details_df <- sem19_comp_result$competitor_details_df
+
+#-----------------------------------------------------------------------------------------------------
+
+```
+
+
+Below code chunk defines function to calculate the centrality measures for each startup based on their investors. The investor syndication networks are created for each semester, based on all the past investments since 2013, and the centrality measures are calculated for each investor. The centrality measures are then aggregated for each startup to get the final centrality measures for the semester.
+
+Note: The function also handles scenarios where the entity might have also been investors in the same semester. In such cases, the entity is identified and labeled differently as an investor to avoid confusion while creating the bipartite graph.
+
+```{r, closeness_centrality, fig.width=15, fig.height=10}
+
+# Function to create closeness_df for a given semester
+calculate_centrality_df <- function(sem_startup_df, sem_funding_details_df) {
+  # Ensure df is not empty and has investor_names
+  df <- sem_funding_details_df%>% filter(!is.na(investor_names))
+  
+  inv <- unique(unlist(strsplit(as.character(df$investor_names), ", ")))
+  ent <- unique(df$name)
+  common_companies <- intersect(inv, ent)
+  
+  add_inv_label <- function(investor_names, common_companies) {
+    investors <- unlist(strsplit(investor_names, ", "))
+    investors <- sapply(investors, function(investor) {
+      if (investor %in% common_companies) {
+        return(paste0(investor, " (inv)"))
+      } else {
+        return(investor)
+      }
+    })
+    return(paste(investors, collapse = ", "))
+  }
+  
+  df$investor_names <- sapply(df$investor_names, add_inv_label, common_companies = common_companies)
+  
+  # Create empty graph object
+  graph <- make_empty_graph()
+
+  # Add vertices (nodes) for entities and investors
+  entity_vertices <- unique(df$entity)
+  investor_vertices <- unique(unlist(strsplit(as.character(df$investor_names), ", ")))
+
+  # Add vertices to the graph
+  graph <- graph %>%
+    add_vertices(length(entity_vertices), color = "steelblue", name = entity_vertices, type = rep("entity", length(entity_vertices))) %>%
+    add_vertices(length(investor_vertices), color = "coral", name = investor_vertices, type = rep("investor", length(investor_vertices)))
+
+  # Create edges between entities and investors
+  for (i in 1:nrow(df)) {
+    entity <- df$entity[i]
+    investors <- unlist(strsplit(as.character(df$investor_names[i]), ", "))
+    
+    # Add edges between entity and each investor
+    edges <- expand.grid(entity, investors)
+    graph <- add_edges(graph, as.vector(t(edges)))
+  }
+
+  # Create one-mode projection graph of investors
+  investor_syndication <- bipartite.projection(graph, types = V(graph)$type == "investor")$proj2
+  
+  investor_graph <- simplify(investor_syndication, remove.loops = TRUE, remove.multiple = TRUE)
+
+  # Calculate centrality measures for investors
+  betweenness_centrality <- betweenness(investor_graph, directed = FALSE, normalized = TRUE, weights = NA)
+  normalized_degree_centrality <- degree(investor_graph, mode = "all", normalized = TRUE)
+  eigenvector_centrality <- eigen_centrality(investor_graph, directed = FALSE, scale = TRUE, weights = NA)$vector
+
+
+  # Helper function to safely calculate mean, max, and sum
+  safe_stat <- function(values, stat_fn) {
+    valid_values <- values[!is.na(values)]
+    if (length(valid_values) == 0) {
+      return(NA)
+    } else {
+      return(stat_fn(valid_values))
+    }
+  }
+
+  # Calculate centrality measures for each startup based on their investors
+  mean_degree_centrality <- sapply(entity_vertices, function(entity) {
+    investors <- unlist(strsplit(as.character(df$investor_names[df$entity == entity]), ", "))
+    safe_stat(normalized_degree_centrality[investors], mean)
+  })
+
+  max_betweenness_centrality <- sapply(entity_vertices, function(entity) {
+    investors <- unlist(strsplit(as.character(df$investor_names[df$entity == entity]), ", "))
+    safe_stat(betweenness_centrality[investors], max)
+  })
+  
+  max_eigenvector_centrality <- sapply(entity_vertices, function(entity) {
+    investors <- unlist(strsplit(as.character(df$investor_names[df$entity == entity]), ", "))
+    safe_stat(eigenvector_centrality[investors], max)
+  })
+
+  # Create a dataframe for each entity with the centrality measures
+  centrality_df <- data.frame(
+    entity = entity_vertices,
+    max_betweenness_centrality = max_betweenness_centrality,
+    mean_degree_centrality = mean_degree_centrality,
+    max_eigenvector_centrality = max_eigenvector_centrality
+  )
+
+  # Replace NaN, 0, and Inf values with NA
+  centrality_df <- as.data.frame(lapply(centrality_df, function(x) {
+    if (is.numeric(x)) {
+      x[is.nan(x) | is.infinite(x)] <- 0
+    }
+    return(x)
+  }))
+  
+  # Filter centrality measures for entities in sem_startup_df
+  centrality_six_months_df <- centrality_df %>% filter(entity %in% sem_startup_df$entity)
+  
+  return(centrality_six_months_df)
+}
+
+# Process the centrality measures for each semester
+sem1_centrality_df <- calculate_centrality_df(sem1_startup_df, sem1_funding_details_df)
+sem2_centrality_df <- calculate_centrality_df(sem2_startup_df, sem2_funding_details_df)
+sem3_centrality_df <- calculate_centrality_df(sem3_startup_df, sem3_funding_details_df)
+sem4_centrality_df <- calculate_centrality_df(sem4_startup_df, sem4_funding_details_df)
+sem5_centrality_df <- calculate_centrality_df(sem5_startup_df, sem5_funding_details_df)
+sem6_centrality_df <- calculate_centrality_df(sem6_startup_df, sem6_funding_details_df)
+sem7_centrality_df <- calculate_centrality_df(sem7_startup_df, sem7_funding_details_df)
+sem8_centrality_df <- calculate_centrality_df(sem8_startup_df, sem8_funding_details_df)
+sem9_centrality_df <- calculate_centrality_df(sem9_startup_df, sem9_funding_details_df)
+sem10_centrality_df <- calculate_centrality_df(sem10_startup_df, sem10_funding_details_df)
+sem11_centrality_df <- calculate_centrality_df(sem11_startup_df, sem11_funding_details_df)
+sem12_centrality_df <- calculate_centrality_df(sem12_startup_df, sem12_funding_details_df)
+sem13_centrality_df <- calculate_centrality_df(sem13_startup_df, sem13_funding_details_df)
+sem14_centrality_df <- calculate_centrality_df(sem14_startup_df, sem14_funding_details_df)
+sem15_centrality_df <- calculate_centrality_df(sem15_startup_df, sem15_funding_details_df)
+sem16_centrality_df <- calculate_centrality_df(sem16_startup_df, sem16_funding_details_df)
+sem17_centrality_df <- calculate_centrality_df(sem17_startup_df, sem17_funding_details_df)
+sem18_centrality_df <- calculate_centrality_df(sem18_startup_df, sem18_funding_details_df)
+sem19_centrality_df <- calculate_centrality_df(sem19_startup_df, sem19_funding_details_df)
+
+
+```
+
+
+Below code chunk can be used to visualize the bipartite network graph of investors and startups for a given semester. The graph is created using the ggnet2 package, which provides an interactive visualization of the network. The size of the nodes in the graph is proportional to their degree centrality, and the color represents the type of node (entity or investor).
+
+Note: As example you can run the code to create a syndication network for sem1 upto 2022 Jun.
+```{r, fig.width=12, fig.height=9}
+
+library(igraph)
+
+# Ensure df is not empty and has investor_names
+df <- sem1_funding_details_df %>% filter(!is.na(investor_names))
+
+inv <- unique(unlist(strsplit(as.character(df$investor_names), ", ")))
+ent <- unique(df$name)
+common_companies <- intersect(inv, ent)
+
+add_inv_label <- function(investor_names, common_companies) {
+  investors <- unlist(strsplit(investor_names, ", "))
+  investors <- sapply(investors, function(investor) {
+    if (investor %in% common_companies) {
+      return(paste0(investor, " (inv)"))
+    } else {
+      return(investor)
+    }
+  })
+  return(paste(investors, collapse = ", "))
+}
+
+df$investor_names <- sapply(df$investor_names, add_inv_label, common_companies = common_companies)
+
+# Create empty graph object
+graph <- igraph::make_empty_graph()
+
+# Add vertices (nodes) for entities and investors
+entity_vertices <- unique(df$entity)
+investor_vertices <- unique(unlist(strsplit(as.character(df$investor_names), ", ")))
+
+# Add vertices to the graph
+graph <- graph %>%
+  add_vertices(length(entity_vertices), color = "steelblue", name = entity_vertices, type = rep("entity", length(entity_vertices))) %>%
+  add_vertices(length(investor_vertices), color = "coral", name = investor_vertices, type = rep("investor", length(investor_vertices)))
+
+# Create a data frame to store edges and their weights
+edges_df <- data.frame(from = character(), to = character(), weight = integer(), stringsAsFactors = FALSE)
+
+# Create edges between entities and investors
+for (i in 1:nrow(df)) {
+  entity <- df$entity[i]
+  investors <- unlist(strsplit(as.character(df$investor_names[i]), ", "))
+  
+  # Add edges between entity and each investor
+  for (investor in investors) {
+    edges_df <- edges_df %>%
+      add_row(from = investor, to = entity, weight = 1)
+  }
+}
+
+# Aggregate edges to count the number of investments
+edges_df <- edges_df %>%
+  group_by(from, to) %>%
+  summarise(weight = sum(weight), .groups = 'drop')
+
+# Add edges to the graph with weights
+for (i in 1:nrow(edges_df)) {
+  graph <- add_edges(graph, c(edges_df$from[i], edges_df$to[i]), attr = list(weight = edges_df$weight[i]))
+}
+
+# Create one mode projection graph of investors
+investor_syndication <- bipartite.projection(graph, types = V(graph)$type == "investor")$proj2
+
+# define the color palette
+V(graph)$color <- ifelse(V(graph)$type == "entity", "steelblue", "tomato")
+
+# Create a subgraph based on eigenvector centrality
+eg_graph <- igraph::eigen_centrality(graph, directed = FALSE, scale = TRUE, weights = NA)$vector
+graph_subset <- igraph::induced_subgraph(graph, V(graph)[eg_graph > 0.02])
+
+# Convert igraph object to network object
+library(intergraph)
+net <- asNetwork(graph_subset)
+
+# Calculate the degree for the nodes in the 'graph' object
+node_degrees <- igraph::degree(graph_subset, mode = "in")
+
+# Ensure the length of node_degrees matches the number of nodes in 'net'
+if (length(node_degrees) != network::network.size(net)) {
+  stop("The length of node_degrees does not match the number of nodes in the network.")
+}
+
+# Plot the bipartite network graph using ggnet2
+ggnet2(net, 
+       color = "type", 
+       palette = c("entity" = "steelblue", "investor" = "coral"), 
+       edge.color = "grey",
+       node.size = degree(net) * 0.4,
+       layout.par = list(layout = "fruchtermanreingold"),
+       legend.position = "bottom") +
+  theme_minimal() +
+  guides(size = "none") +
+  ggtitle("Bipartite Network Graph of Investors and Startups")
+
+# Calculate the degree of each node for the 'investor_syndication' graph
+deg <- igraph::degree(investor_syndication)
+
+# Remove nodes with degree less than 25
+investor_synd_plot <- igraph::delete.vertices(investor_syndication, V(investor_syndication)[deg <= 25])
+
+# Convert the 'investor_synd_plot' graph to a network object
+synd <- asNetwork(investor_synd_plot)
+
+# Plot the graph with the trimmed labels
+ggnet2(synd, 
+       color = communities$membership, 
+       palette = "Set2",
+       edge.color = "grey", 
+       layout.par = list(layout = "fruchtermanreingold"), 
+       node.size = degree(synd) * 0.4, 
+       label = TRUE, 
+       label.size = 2.5, 
+       label.adjust = 0.6,
+       label.trim = TRUE)+
+theme_minimal() +
+ggtitle("Syndication Network of Investors") +
+guides(size = "none")  # Remove node size legend
+
+
+```
+Below code chunk defines a function to read and filter the JSON lines from IPqwery's raw IP data file based on the specified country. The function reads the JSON file line by line, filters the lines containing the specified country and owner IDs, and parses the valid JSON objects. The function then combines the valid JSON objects into a data frame or list for further processing.
+
+```{r, Intellectual_Property}
+
+# Load necessary library
+library(jsonlite)
+
+# Define the function to read and filter JSON lines
+read_and_filter_json <- function(file_path, country_filter) {
+  # Initialize a list to store valid JSON objects
+  filtered_json_objects <- list()
+  
+  # Read the file line by line
+  con <- file(file_path, open = "r")
+  while (TRUE) {
+    line <- readLines(con, n = 1, warn = FALSE)
+    if (length(line) == 0) {
+      break
+    }
+    # Check if the line contains the specified country
+    if (grepl(country_filter, line, ignore.case = TRUE)) {
+      # Try to parse the line as JSON
+      try({
+        json_object <- fromJSON(line)
+        filtered_json_objects <- append(filtered_json_objects, list(json_object))
+      }, silent = TRUE)
+    }
+  }
+  close(con)
+  
+  # Combine all valid JSON objects into a data frame or list
+  return(filtered_json_objects)
+}
+
+# Use the function to read and filter the JSON file for lines with "India"
+country_filter <- '"country":"India"'
+IP_data_India <- read_and_filter_json("ipqwery-owner-full.json", country_filter)
+
+# Save IP_data_India to a json file
+#write_json(IP_data_India, "IP_data_India.json")
+
+# Read the JSON file containing IP data for India
+IP_data_India <- fromJSON("IP_data_India.json")
+
+# Convert the list of valid JSON objects to a data frame
+IP_data_India_df <- bind_rows(lapply(IP_data_India, as.data.frame))
+
+# save the IP_data_India_df to a CSV file
+#write.csv(IP_data_India_df, "IP_data_India_df.csv")
+IP_data_India_df <- read.csv("IP_data_India_df.csv", stringsAsFactors = FALSE)
+
+# Find the matching uuidss between IP data and organization details
+matching_uuid_IP <- intersect(IP_data_India_df$crunchbase_uuid, org_details$uuid)
+
+# Filter the organization details and IP data based on the matching uuids
+org_IP_matches_df <- org_details[org_details$uuid %in% matching_uuid_IP,]
+
+IP_data_matching_df <- IP_data_India_df[IP_data_India_df$crunchbase_uuid %in% matching_uuid_IP,]
+
+# Merge the IP data with the organization details by uuid
+IP_data_org_df <- merge(IP_data_matching_df, org_IP_matches_df, by.x = "crunchbase_uuid", by.y = "uuid", all.x = TRUE)
+
+# Define the function to read and filter JSON lines
+read_and_filter_json_by_ownerId <- function(file_path, ownerIds) {
+  # Initialize a list to store valid JSON objects
+  filtered_json_objects <- list()
+  
+  # Read the file line by line
+  con <- file(file_path, open = "r")
+  while (TRUE) {
+    line <- readLines(con, n = 1, warn = FALSE)
+    if (length(line) == 0) {
+      break
+    }
+    # Check if the line contains any of the specified ownerIds
+    for (ownerId in ownerIds) {
+      if (grepl(paste0('"', ownerId, '"'), line)) {
+        # Try to parse the line as JSON
+        try({
+          json_object <- fromJSON(line)
+          filtered_json_objects <- append(filtered_json_objects, list(json_object))
+        }, silent = TRUE)
+        break # Exit the loop once a match is found
+      }
+    }
+  }
+  close(con)
+  
+  # Combine all valid JSON objects into a data frame or list
+  return(filtered_json_objects)
+}
+
+# Extract the relevant owner ids only 
+ownerIds <- IP_data_matching_df$id
+
+# Use the function to read and filter the JSON file for lines with specified ownerIds
+trademark_data <- read_and_filter_json_by_ownerId("ipqwery-wo-trademark.json", ownerIds)
+
+trademark_data[1:5]
+
+# Flatten and combine the list of JSON objects into a single data frame
+trademark_df <- bind_rows(lapply(trademark_data, function(x) {
+  as.data.frame(flatten(x), stringsAsFactors = FALSE)
+})) %>% 
+  mutate(
+    publicationDate = ymd(publicationDate),
+    ip_issueRegDate = ymd(ip_issueRegDate),
+    ip_firstPubFilingDate = ymd(ip_firstPubFilingDate),
+    filingDate = ymd(filingDate),
+    registrationDate = ymd(registrationDate)
+  )
+
+# Group the trademark data by ownerId
+grouped_trademark_df <- trademark_df %>%
+  group_by(ownerId) %>%
+  summarise(num_trademarks = n())
+
+# Save the trademark data to a CSV file
+write.csv(trademark_df, "trademark_df.csv")
+
+# load the trademark_df
+trademark_df <- read.csv("trademark_df.csv", stringsAsFactors = FALSE)
+
+# Define function to filter and merge the trademark data with IP_data_org_df
+# and process it for each semester
+# based on registration date being before the end of the semester date
+filter_group_and_merge_trademarks <- function(trademark_df, IP_data_org_df, semester_end_date) {
+  # Ensure registrationDate is of Date type
+  trademark_df <- trademark_df %>% 
+    mutate(
+      registrationDate = ymd(registrationDate), # Convert registrationDate to Date format using lubridate
+      ownerId = as.character(ownerId) # Ensure ownerId is a character
+    )
+  
+  # Filter the trademarks as per the registrationDate and remove rows with NA in ownerId
+  filtered_trademark_df <- trademark_df %>% 
+    filter(registrationDate <= semester_end_date, !is.na(ownerId))
+  
+  # Group the trademark data by ownerId
+  grouped_trademark_df <- filtered_trademark_df %>%
+    group_by(ownerId) %>%
+    summarise(num_trademarks = n(), .groups = 'drop')
+  
+  # Merge the grouped trademark data with IP_data_org_df
+  merged_df <- merge(IP_data_org_df, grouped_trademark_df, by.x = "id", by.y = "ownerId", all.x = TRUE)
+  
+  # Filter the merged data frame to include only rows where num_trademarks is not NA
+  result_df <- merged_df %>%
+    filter(!is.na(num_trademarks)) %>%
+    select(crunchbase_uuid, num_trademarks)
+  
+  return(result_df)
+}
+
+# Process the trademark data for each semester
+sem1_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem1_end_date)
+sem2_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem2_end_date)
+sem3_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem3_end_date)
+sem4_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem4_end_date)
+sem5_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem5_end_date)
+sem6_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem6_end_date)
+sem7_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem7_end_date)
+sem8_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem8_end_date)
+sem9_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem9_end_date)
+sem10_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem10_end_date)
+sem11_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem11_end_date)
+sem12_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem12_end_date)
+sem13_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem13_end_date)
+sem14_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem14_end_date)
+sem15_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem15_end_date)
+sem16_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem16_end_date)
+sem17_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem17_end_date)
+sem18_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem18_end_date)
+sem19_trademark_df <- filter_group_and_merge_trademarks(trademark_df, IP_data_org_df, sem19_end_date)
+
+```
+
+Below code chunk defines a function to read and filter the JSON lines from IPqwery's raw patent data file based on the specified owner IDs. The function reads the JSON file line by line, filters the lines containing the specified owner IDs, and parses the valid JSON objects. The function then combines the valid JSON objects into a data frame or list for further processing.
+
+```{r, Patents}
+
+# Define the file path
+file_path <- "ipqwery-wo-patent.json"
+
+# Parse each line as JSON
+parsed_json <- lapply(first_10_lines, function(line) {
+  fromJSON(line, flatten = TRUE)
+})
+
+# Load in patents data
+patent_data <- read_and_filter_json_by_ownerId("ipqwery-wo-patent.json", ownerIds)
+
+# save the patent data as a .json file
+write_json(patent_data, "patent_data.json")
+
+# Flatten and combine the list of JSON objects into a single data frame
+patent_df <- bind_rows(lapply(patent_data, function(x) {
+  as.data.frame(flatten(x), stringsAsFactors = FALSE)
+})) %>% 
+  mutate(
+    issueDate = ymd(issueDate))
+
+# Remove any column with "X.*" in the name
+patent_df <- patent_df[, !grepl("X.*", colnames(patent_df))]
+
+#Save the patent data to a CSV file
+#write.csv(patent_df, "patent_df.csv")
+
+#load the patent data
+patent_df <- read.csv("patent_df.csv")
+
+# Define function to filter and merge the patent data with IP_data_org_df
+# and process it for each semester
+# based on issue date being before the end of the semester date
+filter_and_group_patents <- function(patent_df, IP_data_org_df, semester_end_date) {
+  # Ensure issueDate is of Date type
+  patent_df <- patent_df %>% 
+    mutate(
+      issueDate = ymd(issueDate), # Convert issueDate to Date format using lubridate
+      ownerId = as.character(ownerId), # Ensure ownerId is a character
+      title = as.character(title) # Ensure title is a character
+    )
+  
+  # Filter the patents as per the issueDate and remove rows with NA in ownerId
+  filtered_patent_df <- patent_df %>% 
+    filter(issueDate <= semester_end_date, !is.na(ownerId))
+  
+  # Group the patent data by ownerId and title
+  grouped_patent_df <- filtered_patent_df %>%
+    group_by(ownerId) %>%
+    summarise(num_patents = n())
+  
+  # Merge the grouped patent data with IP_data_org_df
+  merged_df <- merge(IP_data_org_df, grouped_patent_df, by.x = "id", by.y = "ownerId", all.x = TRUE)
+  
+  # Filter the merged data frame to include only rows where num_patents is not NA
+  result_df <- merged_df %>%
+    filter(!is.na(num_patents)) %>%
+    select(name = name.y, num_patents)
+  
+  return(result_df)
+}
+
+sem1_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem1_end_date)
+sem2_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem2_end_date)
+sem3_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem3_end_date)
+sem4_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem4_end_date)
+sem5_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem5_end_date)
+sem6_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem6_end_date)
+sem7_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem7_end_date)
+sem8_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem8_end_date)
+sem9_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem9_end_date)
+sem10_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem10_end_date)
+sem11_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem11_end_date)
+sem12_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem12_end_date)
+sem13_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem13_end_date)
+sem14_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem14_end_date)
+sem15_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem15_end_date)
+sem16_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem16_end_date)
+sem17_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem17_end_date)
+sem18_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem18_end_date)
+sem19_patent_df <- filter_and_group_patents(patent_df, IP_data_org_df, sem19_end_date)
+
+
+
+```
+
+Below code chunk defines the function to extract the patent information from the WIPO website for each startup. The function uses RSelenium to automate the web scraping process and extract the patent information based on the startup's legal names. The function iterates over the list of startup names, searches for each startup on the WIPO website, and extracts the patent information if available. The extracted patent information is stored in a list for further processing.
+
+```{r, patent_search}
+
+# Replace the NAs in legal name with the name
+org_details$legal_name[which(is.na(org_details$legal_name) == TRUE)] <- org_details$name[which(is.na(org_details$legal_name) == TRUE)]
+# Remove all instances of Pvt. Ltd./Pvt Ltd/Private Limited/ PRIVATE LIMITED from the legal name
+startup_names <- gsub("Pvt[.]? Ltd[.]?|Private Limited|PRIVATE LIMITED|Private.*", "", org_details$legal_name, ignore.case = TRUE) %>% str_trim()
+startup_names_WIPO <- startup_names
+# Add "ALLNAMES: " prefix to each startup name
+
+startup_names_WIPO <- paste0('PA:', '"', startup_names_WIPO, '"')
+#startup <- startup_names[1]
+
+# Create an automated RSelenium web scraper to extract the patent information from WIPO website for each startup
+# Initialize the RSelenium server
+url<- "https://patentscope.wipo.int/search/en/search.jsf"
+
+# Start the Selenium server:
+rD <- rsDriver(browser=c("firefox"), verbose = F, port = netstat::free_port(random = TRUE), chromever = NULL) 
+driver <- rD[["client"]] 
+
+# Navigate to the selected URL address
+driver$navigate(url)
+
+#wait for 1 seconds
+Sys.sleep(1)
+
+# Find the search bar element
+#search_bar <- driver$findElement(using = "css selector", value = "input[id='simpleSearchForm:fpSearch:input']")
+
+startup_names_WIPO[3001:3500]
+
+# Does any name in startup_names_WIPO[3001:3500] matches with EduGorilla
+startup_names_WIPO[3001:3500]
+which(startup_names_WIPO[3001:3500] == 'PA:"EduGorilla"')
+
+length(startup_names_WIPO)
+
+# Initialise a list to store the patent information
+patent_info <- list()
+# Enter the startup name in the search bar
+for (startup in startup_names_WIPO[8501:8961]) {
+  tryCatch({
+    skip_to_next <- FALSE
+    
+    if (startup == startup_names_WIPO[8501]) {
+      search_menuitem <- driver$findElement(using = "css selector", value = "button[id='formMainMenu:triggerSearchMenu']")
+      search_menuitem$clickElement()
+      search_advanced_option <- driver$findElement(using = "css selector", value = "a[id='formMainMenu:advancedSearch']")
+      search_advanced_option$clickElement()
+      Sys.sleep(2)
+      driver$executeScript("window.scrollBy(0, 200);")
+      office_option <- driver$findElement(using = "css selector", value = "button.ps-office--button")
+      office_option$clickElement()
+      driver$executeScript("window.scrollBy(0, 1000);")
+      india_checkbox <- driver$findElement(using = "css selector", value = "input[id^='advancedSearchForm:office:j_idt'][id*=':18']")
+      india_checkbox$clickElement()
+      Sys.sleep(1)
+      driver$executeScript("window.scrollBy(0, 1000);")
+      Sys.sleep(1)
+      stemming <- driver$findElement(using = "css selector", value = "input[id='advancedSearchForm:stemmingOption:input']")
+      stemming$clickElement()
+      sfm <- driver$findElement(using = "css selector", value = "div[id='advancedSearchForm:singleFamilyMemberOption']")
+      driver$mouseMoveToLocation(webElement = sfm)
+      Sys.sleep(1)
+      sfm_checkbox <- driver$findElement(using = "css selector", value = "input[id='advancedSearchForm:singleFamilyMemberOption:input']")
+      sfm_checkbox$clickElement()
+      
+      adv_search_bar <- driver$findElement(using = "css selector", value = ".js-advanced-search-input")
+      adv_search_bar$sendKeysToElement(list(startup))
+      Sys.sleep(1)
+      adv_search_bar$sendKeysToElement(list(key = "enter"))
+      
+      Sys.sleep(5)
+    } else {
+      adv_search_bar <- driver$findElement(using = "css selector", value = ".js-advanced-search-input")
+      adv_search_bar$clearElement()
+      adv_search_bar$sendKeysToElement(list(startup))
+      adv_search_bar$sendKeysToElement(list(key = "enter"))
+      Sys.sleep(7)
+    }
+    
+    # Check for the existence of the 'National Biblio. Data' link
+    patent_summary_exists <- FALSE
+    tryCatch({
+      patent_summary <- driver$findElement(using = "xpath", value = "//a[contains(.,'Documents')]")
+      if (!is.null(patent_summary)) {
+        patent_summary_exists <- TRUE
+      }
+    }, error = function(e) {
+      patent_summary_exists <- FALSE
+    })
+    
+    if (patent_summary_exists) {
+      back_button <- driver$findElement(using = "css selector", value = "div.ps-buttons-bar--item:nth-child(2) > a")
+      back_button$clickElement()
+      Sys.sleep(3)
+    }
+    
+    results_count <- driver$findElement(using = "css selector", value = "span.results-count")$getElementText()
+    patent_count <- as.numeric(gsub("\\D", "", results_count))
+    
+    # Set the "Per page" view to 200 if it's not already set
+    per_page_dropdown <- driver$findElement(using = "css selector", value = "select[id='resultListCommandsForm:perPage:input']")
+    selected_option <- per_page_dropdown$getElementAttribute("value")[[1]]
+    
+    if (selected_option != "200") {
+      per_page_dropdown$clickElement()
+      Sys.sleep(1)
+      option_200 <- driver$findElement(using = "xpath", value = "//select[@id='resultListCommandsForm:perPage:input']/option[@value='200']")
+      option_200$clickElement()
+      Sys.sleep(3)
+    }
+    
+    if (patent_count == 0) {
+      skip_to_next <- TRUE
+      patent_info[[startup]] <- data.frame(
+        patent_applicant = NA,
+        patent_class = NA,
+        patent_title = NA,
+        patent_date_info = NA,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      message(paste("Found", patent_count, "patents for startup", startup))
+    }
+    
+    if (skip_to_next) {
+      next
+    }
+    
+    patent_info[[startup]] <- data.frame(
+      patent_applicant = character(patent_count),
+      patent_class = character(patent_count),
+      patent_title = character(patent_count),
+      patent_date_info = character(patent_count),
+      stringsAsFactors = FALSE
+    )
+    
+    # Find the patent information from the results and store in the dataframe
+    for (i in 1:patent_count) {
+      patent_date_selector <- paste0("span[id='resultListForm:resultTable:", i-1, ":resultListTableColumnPubDate']")
+      patent_date <- driver$findElement(using = "css selector", value = patent_date_selector)$getElementText()
+      patent_info[[startup]][i, "patent_date_info"] <- patent_date
+      
+      patent_title_selector <- paste0("div[id='resultListForm:resultTable:", i-1, ":patentResult'] > div.ps-patent-result--first-row > div.ps-patent-result--title > span.ps-patent-result--title--title")
+      patent_title <- driver$findElement(using = "css selector", value = patent_title_selector)$getElementText()
+      patent_info[[startup]][i, "patent_title"] <- patent_title
+      
+      patent_applicant_selector <- paste0("div[id='resultListForm:resultTable:", i-1, ":patentResult'] > div.ps-patent-result--second-row > div.ps-patent-result--fields > div.ps-patent-result--fields--group > span:nth-child(3)")
+      patent_applicant <- driver$findElement(using = "css selector", value = patent_applicant_selector)$getElementText()
+      patent_info[[startup]][i, "patent_applicant"] <- patent_applicant
+      
+      patent_class_selector <- paste0("div[id='resultListForm:resultTable:", i-1, ":patentResult'] > div.ps-patent-result--second-row > div.ps-patent-result--fields > div.ps-patent-result--fields--group > span:nth-child(1)")
+      patent_class <- driver$findElement(using = "css selector", value = patent_class_selector)$getElementText()
+      patent_info[[startup]][i, "patent_class"] <- patent_class
+    }
+    Sys.sleep(3)
+  }, error = function(e) {
+    message(paste("Error processing startup:", startup, "-", e$message))
+  })
+}
+
+# Combine the individual dataframes into one dataframe
+patent_info_df <- do.call(rbind, lapply(names(patent_info), function(name) {
+  df <- patent_info[[name]]
+  df$startup <- name
+  df
+}))
+
+# Load the retrieved patent information from the CSV file
+patent_info_combined <- read_csv("patent_info.csv")
+
+# Clean the text for startup names
+patent_info_combined$startup <- gsub("PA:|\"", "", patent_info_combined$startup)
+patent_info_combined$patent_date_info <- as.Date(patent_info_combined$patent_date_info, format = "%d.%m.%Y")
+
+# Define the function to merge and process the patent information for each semester
+# Based on time stamps of the published date
+update_startup_df_with_patent_counts <- function(sem_startup_df, patent_info_combined, sem_end_date, org_details) {
+  
+  # Filter patents up to sem_end_date
+  sem_patents_df <- patent_info_combined %>%
+    filter(patent_date_info <= sem_end_date)
+  
+  # Group patents by startup and count the number of patents
+  sem_patent_count <- sem_patents_df %>%
+    group_by(startup) %>%
+    summarise(num_patents = n())
+  
+  # Combine legal_name from org_details with name from sem_startup_df
+  sem_startup_df$legal_name <- org_details$legal_name[match(sem_startup_df$name, org_details$name)]
+  
+  # Initialize the num_patents column if it doesn't exist
+  if (!"num_patents" %in% names(sem_startup_df)) {
+    sem_startup_df$num_patents <- NA
+  }
+  
+  # Iterate over each row in sem_startup_df and update num_patents
+  for (i in 1:nrow(sem_startup_df)) {
+    startup_name <- sem_startup_df$name[i]
+    legal_name <- sem_startup_df$legal_name[i]
+    
+    # Find the corresponding num_patents from sem_patent_count
+    patent_count <- sem_patent_count$num_patents[
+      sem_patent_count$startup == startup_name |
+      sem_patent_count$startup == legal_name
+    ]
+    
+    # Update the num_patents column
+    if (length(patent_count) > 0) {
+      sem_startup_df$num_patents[i] <- patent_count
+    }
+  }
+  
+  sem_patents_df <- sem_startup_df %>% select(name, num_patents)
+  
+  return(sem_patents_df)
+}
+
+# Process the patent information for each semester
+sem1_patents_df <- update_startup_df_with_patent_counts(sem1_startup_df, patent_info_combined, as.Date("2022-06-30"), org_details)
+
+sem2_patents_df <- update_startup_df_with_patent_counts(sem2_startup_df, patent_info_combined, as.Date("2021-12-31"), org_details)
+
+sem3_patents_df <- update_startup_df_with_patent_counts(sem3_startup_df, patent_info_combined, as.Date("2021-06-30"), org_details)
+
+sem4_patents_df <- update_startup_df_with_patent_counts(sem4_startup_df, patent_info_combined, as.Date("2020-12-31"), org_details)
+
+sem5_patents_df <- update_startup_df_with_patent_counts(sem5_startup_df, patent_info_combined, as.Date("2020-06-30"), org_details)
+
+sem6_patents_df <- update_startup_df_with_patent_counts(sem6_startup_df, patent_info_combined, sem6_end_date, org_details)
+
+sem7_patents_df <- update_startup_df_with_patent_counts(sem7_startup_df, patent_info_combined, sem7_end_date, org_details)
+
+sem8_patents_df <- update_startup_df_with_patent_counts(sem8_startup_df, patent_info_combined, sem8_end_date, org_details)
+
+sem9_patents_df <- update_startup_df_with_patent_counts(sem9_startup_df, patent_info_combined, sem9_end_date, org_details)
+
+sem10_patents_df <- update_startup_df_with_patent_counts(sem10_startup_df, patent_info_combined, sem10_end_date, org_details)
+
+sem11_patents_df <- update_startup_df_with_patent_counts(sem11_startup_df, patent_info_combined, sem11_end_date, org_details)
+
+sem12_patents_df <- update_startup_df_with_patent_counts(sem12_startup_df, patent_info_combined, sem12_end_date, org_details)
+
+sem13_patents_df <- update_startup_df_with_patent_counts(sem13_startup_df, patent_info_combined, sem13_end_date, org_details)
+
+sem14_patents_df <- update_startup_df_with_patent_counts(sem14_startup_df, patent_info_combined, sem14_end_date, org_details)
+
+sem15_patents_df <- update_startup_df_with_patent_counts(sem15_startup_df, patent_info_combined, sem15_end_date, org_details)
+
+sem16_patents_df <- update_startup_df_with_patent_counts(sem16_startup_df, patent_info_combined, sem16_end_date, org_details)
+
+sem17_patents_df <- update_startup_df_with_patent_counts(sem17_startup_df, patent_info_combined, sem17_end_date, org_details)
+
+sem18_patents_df <- update_startup_df_with_patent_counts(sem18_startup_df, patent_info_combined, sem18_end_date, org_details)
+
+sem19_patents_df <- update_startup_df_with_patent_counts(sem19_startup_df, patent_info_combined, sem19_end_date, org_details)
+
+
+```
+
+Below code chunk preprocesses the startup descriptions and applies Structural Topic Modeling (STM) to extract topics from the descriptions. The function returns the extracted topics and their corresponding representative words.
+
+```{r, STM, fig.width=15, fig.height=10}
+
+# Load the data
+
+org_details_STM <- fromJSON("org_details_final_STM.json")
+
+org_details_STM$founded_on_date <- as.Date(org_details_STM$founded_on_date)
+org_details_STM$founding_year <- as.numeric(format(org_details_STM$founded_on_date, "%Y"))
+
+# Tier 1
+tier_1 <- c("Mumbai", "Delhi NCR", "Bengaluru", "Kolkata", "Chennai", "Hyderabad", 
+            "Pune", "Ahmedabad", "Gurugram", "Noida", "Thane", "Bandra", "Worli", "Ghatkopar", 
+            "Vashi", "Goregaon", "Andheri", "Borivli", "Mallesvaram", "Kormangala",
+            "Whitefield", "Mysore", "Secunderabad", "Bengaluru", "Bangalore", "New Delhi", "Gurgaon", "Delhi", 
+            "Ghaziabad", "Bangalore City", "Haryana", "Madras", "Bombay", "Vizag", "Bengalooru", "Powai", "Dehli",
+            "Vikhroli", "Yelahanka", "Connaught Place", "Aundh", "Juhu", "Kalkaji", "Virar", "Malad" )
+
+# Tier 2
+
+tier_2 <- c("Jaipur City", "Indore", "Jaipur", "Coimbatore", "Lucknow", "Bhubaneswar", "Chandigarh", "Kochi", "Bhopal", 
+            "Vishakhapatnam", "Ludhiana", "Nashik", "Jamshedpur", "Dehradun", "Rajkot", 
+            "Varanasi", "Amritsar", "Jabalpur", "Raipur", "Ranchi", "Gwalior", "Kota", 
+            "Guwahati", "Hubli", "Mysore", "Trichy", "Vijayawada", "Madurai", "Aurangabad", 
+            "Tirupur", "Mangalore", "Udaipur", "Meerut", "Siliguri", "Bhilai", "Jodhpur", 
+            "Thiruvananthapuram", "Durgapur", "Thanjavur", "Kakinada", "Vellore", "Gorakhpur", 
+            "Bokaro", "Allahabad", "Aligarh", "Bareilly", "Muzaffarpur", "Bilaspur", 
+            "Erode", "Agra", "Nellore", "Jhansi", "Kollam", "Hisar", "Panipat", "Karnal", 
+            "Roorkee", "Rohtak", "Bikaner", "Bhatinda", "Shimla", "Jammu", "Kurukshetra", 
+            "Jhajjar", "Rohtak", "Panaji", "Gandhidham", "Tirupati", "Ambala", "Kharagpur", 
+            "Jorhat", "Bhagalpur", "Sonepat", "Thanjavur", "Kottayam", "Nagercoil", 
+            "Bardoli", "Gandhinagar", "Patna City","Surat", "Vadodara", 
+            "Patna", "Nagpur", "Kanpur", "Dehra Dun", "Puducherry", "Cochin", 
+            "Mohali", "Visakhapatnam", "Jalandhar", "Trivandrum", "Ahmadabad", 
+            "Howrah", "Mylapore", "Nasik", "Gandhinagar", "Calicut", "Belgaum",
+            "Panjim", "Shillong", "Bhubaneshwar", "Goa", "Darjeeling", "Eluru", 
+            "Mangaldai", "Srinagar", "Cuttack", "Lalitpur", "Gujrat", "Salem", 
+            "Rameswaram", "Tirunelveli", "Khargone", "Kohima", "Mahim", "Jamnagar", "Kozhikode", 
+            "Lucknow City", "Mangaluru", "Kurla", "Anantapur", "Kodambakkam", "Madhapur", "Rajkot", 
+            "Udaipur City", "Panjim", "Bihar","Mathura", "Assagao", "Sonipat", "Alwar", "Lonavla", "Candolim", "Kharadi")
+
+# Tier 3
+tier_3 <- c("Alwarpet", "Thrissur", "Bhilwara", "Ahmednagar", "Tiruchirappalli", 
+            "Gandhidham", "Dungarpur", "Kanniyakumari", "Ernakulam", "Amravati",
+            "Anjuna", "Mehsana", "Vapi", "Dharwad", "Rae Bareli", "Rourkela", "Bhiwani", 
+            "Bhavnagar", "Darbhanga", "Kota", "Patiala", "Anand", "Junagadh", "Agartala",
+            "Panvel", "Bilaspur", "Bokaro", "Betul", "Dhule", "Fatehpur", "Bhilwara", 
+            "Faizabad", "Karnal", "Porbandar", "Solapur", "Gandhinagar", "Saharanpur", 
+            "Phagwara", "Jalgaon", "Haldwani", "Raichur", "Ahmednagar", "Patiala", 
+            "Faridabad", "Sangareddi", "Berhampur", "Faizabad", "Nadiad", "Puri", 
+            "Bikaner", "Akola", "Hazaribagh", "Dindigul", "Sangli", "Manipal", "Sholapur", 
+            "Bardhaman", "Kottarakara", "Jhargram", "Siwan", "Orai", "Barmer", "Haldia", 
+            "Hoshiarpur", "Phagwara", "Bhadrak", "Bidar", "Kadapa", "Balasore", "Hassan", 
+            "Srikakulam", "Tiruvannamalai", "Sirsa", "Rishikesh", "Mathura", "Haridwar", 
+            "Bilaspur", "Madgaon", "Neemuch", "Satara", "Rajahmundry", "Karaikudi", 
+            "Kumbakonam", "Sivakasi", "Madikeri", "Hoshiarpur", "Ratlam", "Chittaurgarh", 
+            "Bharatpur", "Pithoragarh", "Cuddalore", "Churu", "Vaniyambadi", "Mancherial", 
+            "Kasaragod", "Surendranagar", "Beed", "Jajpur", "Balaghat", "Kannur", 
+            "Bahadurgarh", "Gangtok", "Hansi", "Sultanpur", "Chhapra", "Karaikudi", 
+            "Rourkela", "Bhusawal", "Neemuch", "Hoshangabad", "Jalpaiguri", "Pithoragarh", 
+            "Gadag", "Chikmagalur", "Raichur", "Haveri", "Tumkur", "Vizianagaram", "Udupi", 
+            "Almora", "Daman", "Karaikal", "Wardha", "Sambalpur", "Anantapuramu", "Silchar", 
+            "Jhumri Telaiya", "Dhule", "Silvassa", "Aizawl", "Barwani", "Perungudi", 
+            "Satna", "Ballari", "Goalpara", "Barmer", "Bijapur", "Gangavathi", "Mandsaur", 
+            "Dharampur", "Sonepat", "Suri", "Tamluk", "Vaniyambadi", "Damoh", 
+            "Hamirpur", "Mahasamund", "Narsinghpur", "Shimoga", "Alibag", "Bhimavaram", 
+            "Ratlam", "Fatehabad", "Ganjam", "Dholpur", "Aluva", "Mangalagiri", "Bhavnagar", 
+            "Rewari", "Bettiah", "Dewas", "Rae Bareli", "Khandwa", "Kishanganj", "Datia", 
+            "Angul", "Bhilwara", "Anand", "Ooty", "Kolhapur", "Nawada", "Tezpur", "Rudrapur", 
+            "Gandhinagar", "Bhadravati", "Latur", "Haldwani", "Kanchipuram", "Rudrapur", 
+            "Jamui", "Bhagalpur", "Chittoor", "Gwalior", "Balasore", "Patiala", "Rewa", 
+            "Hoshangabad", "Khammam", "Morbi", "Hoshiarpur", "Patan", "Ghazipur", "Jind", 
+            "Gondal", "Parbhani", "Haveri", "Mandsaur", "Raigarh", "Daman", 
+            "Nadiad", "Bhimavaram", "Betul", "Gadag", "Mahesana", "Vellore", "Chittoor", 
+            "Kolar", "Imphal", "Churachandpur", "Bilaspur", "Thanjavur", "Ujjain", "Suri", 
+            "Kumbakonam", "Bharuch", "Katni", "Tinsukia", "Basti", "Sultanpur", "Itarsi", 
+            "Davangere", "Kasaragod", "Buxar", "Beed", "Fatehpur", "Rajahmundry", "Shimoga", 
+            "Srikakulam", "Kanchipuram", "Jalna", "Orai", "Haldia", "Azamgarh", "Palakkad", 
+            "Porbandar", "Sirsa", "Malappuram", "Sonepat", "Darbhanga", "Arrah", "Murwara", 
+            "Pithoragarh", "Mirzapur", "Ratlam", "Dhamtari", "Chur", 
+            "Hosur", "Dharapuram", "Sachin", "Kharar", "Numbai", "Najafgarh", "Bhind", 
+            "Krishnagiri", "Wagholi", "Alandur", 
+           "Karwar", "Alappuzha", "Madipakkam", "Kedgaon", "Hajipur", "Taramani", 
+           "Tarapur", "Kalyani", "Solan", "Shivpuri", "Farrukhabad", "Krishnapur", 
+           "Pilani", "Firozabad", "Pathanamthitta", "Khalilabad", "Nagaon", "Rabda", "Chirala", 
+           "Mahuva", "Munger", "Dera Bassi", "Kondapur", "Nadia", "Khandala", "Baroda", 
+           "Ramanathapuram", "Rayachoti", "Cuddapah", "Parel", "Badarpur", "Margão", "Vasai", 
+           "Hong", "Paharganj", "Behror", "Rasipuram", "Purnea", "Thanesar", "Shahdara", 
+           "Kandi", "Mandi", "Kushalnagar", "East Godavari", "Bhiwandi", "Dahod", "Taranagar", 
+           "Verna", "Namakkal", "Sohna", "Kandivli", "Yamunanagar", "Una", "Salt Lake City", 
+           "Jashpurnagar", "Mandya", "Sanquelim", "Burdwan", "Chanditala", 
+            "Karur", "Hyderabad-deccan", "Tardeo", "Azadpur", "Leh", "Kothapet", 
+           "Chamba", "Suryapet", "Unnao", "Nelamangala", "Karimnagar", "Rangia", 
+            "Hissar", "Juhu", "Kangra", "Mandrem", "Teni", "Gopalganj", "Mahalaxmi", 
+           "Surajpur", "Madanpur", "Dhanbad", "Pondicherry", "Gudivada", "Teynampet", 
+           "Dona Paula", "Sarjapur", "Kupwara", "Etawah", "Nungambakkam", "Shrirangapattana", 
+           "Keonjhar", "Mehrauli", "Kotdwara", "Tiruppur", "Mainpuri", "Ballia", "Kakkad", 
+           "Farrukhnagar", "Dharmsala", "Chengalpattu", "Vile Parle", "Guindy", 
+           "Ankleshwar", "Pallavaram", "Udipi", "Dubai", "Bhawanipatna", "Kharagpur", "Kanyakumari",
+           "Dwarka")
+
+# Create a new column for city tier in the meta data
+org_details_STM$city_tier <- ifelse(org_details_STM$city %in% tier_1, "Tier 1",
+                                   ifelse(org_details_STM$city %in% tier_2, "Tier 2", ifelse(org_details_STM$city %in% tier_3, "Tier 3", "NA")))
+
+meta_entities <- org_details_STM$identifier$permalink
+
+org_details_meta <- org_details_STM %>% mutate(entity = org_details_STM$identifier$permalink)
+
+# Add a sector column to the org_details_meta dataframe which contains just the first category keyword
+org_details_meta$sector <- sapply(org_details_meta$category_keywords, function(x) {
+  # Split the category keywords by comma
+  split_keywords <- strsplit(x, ",\\s*")[[1]]
+  # Return the first keyword if there are any, otherwise return NA
+  if (length(split_keywords) > 0) {
+    return(split_keywords[1])
+  } else {
+    return("NA")
+  }
+})
+
+org_details_meta <- org_details_meta[!duplicated(org_details_meta$name),]
+org_details_meta <- org_details_meta[!is.na(org_details_meta$industry),]
+org_details_meta <- org_details_meta[which(!is.na(org_details_meta$description)),]
+
+
+
+# Create a new meta dataframe by extracting details from all_entities list for STM analysis
+# Initialize meta_df to avoid errors in the rbind step
+meta_df <- data.frame(
+                      entity = character(),
+                      legal_name = character(),
+                      funding_total = numeric(),
+                      last_funding_type = character(),
+                      num_funding_rounds = numeric(),
+                      num_investors = numeric(),
+                      num_founders = numeric(),
+                      num_articles = numeric(),
+                      stringsAsFactors = FALSE)
+
+for (entity in meta_entities) {
+  current_entity <- all_entities[[entity]]
+  
+  # Extract properties safely, providing default values if they are missing
+  funding_total <- ifelse(!is.null(current_entity$properties$funding_total$value_usd), current_entity$properties$funding_total$value_usd, 0)
+  legal_name <- ifelse(!is.null(current_entity$properties$legal_name), current_entity$properties$legal_name, "")
+  last_funding_type <- ifelse(!is.null(current_entity$properties$last_funding_type), current_entity$properties$last_funding_type, "")
+  num_funding_rounds <- ifelse(!is.null(current_entity$properties$num_funding_rounds), current_entity$properties$num_funding_rounds, 0)
+  name <- ifelse(!is.null(current_entity$properties$name), current_entity$properties$name, "")
+  num_founders <- ifelse(!is.null(current_entity$properties$num_founders), current_entity$properties$num_founders, 0)
+
+  # Handle funding rounds
+  funding_rounds <- current_entity$cards$raised_funding_rounds
+  if (length(funding_rounds) == 0) {
+    num_investors <- 0
+  } else {
+    if ("is_equity" %in% colnames(funding_rounds)) {
+      equity_rounds <- funding_rounds[funding_rounds$is_equity == TRUE, ]
+      if (nrow(equity_rounds) == 0) {
+        num_investors <- 0
+      } else {
+        if (is.null(equity_rounds$num_investors)) {
+          num_investors <- 0
+        } else {
+          num_investors <- sum(equity_rounds$num_investors, na.rm = TRUE)
+        }
+      }
+    } else {
+      num_investors <- 0
+    }
+  }
+
+  # Handle press mentions
+  press_mentions <- current_entity$cards$press_references
+  if (length(press_mentions) == 0) {
+    num_articles <- 0
+  } else {
+    num_articles <- nrow(press_mentions)
+  }
+
+  # Combine the extracted details into a dataframe
+  meta_df <- rbind(meta_df, data.frame(
+    entity = entity,
+    legal_name = legal_name,
+    funding_total = funding_total, 
+    last_funding_type = last_funding_type, 
+    num_funding_rounds = num_funding_rounds, 
+    num_investors = num_investors, 
+    num_founders = num_founders, 
+    num_articles = num_articles, 
+    stringsAsFactors = FALSE
+  ))
+}
+
+
+# Merge selected columns of org details with meta_df
+org_details_STM <- merge(
+  org_details_meta[, c("name", "entity", "ipo_status", "status", "founded_on_date", "description", "category_keywords", "city", "state", "exited_on", "closed_on_date", "went_public_on", "sector", "industry", "city_tier", "founding_year")],
+  meta_df,
+  by = "entity",
+  all.x = TRUE,
+)
+
+
+# Clean the description column
+  org_details_STM$description <- gsub("\\n", " ", org_details_STM$description)
+  org_details_STM$description <- gsub("\\t", " ", org_details_STM$description)
+  org_details_STM$description <- gsub("\\r", " ", org_details_STM$description)
+  org_details_STM$description<- gsub("http\\S+\\s*", "", org_details_STM$description)
+  org_details_STM$description <- gsub("www\\S+\\s*", "", org_details_STM$description)
+  org_details_STM$description <- gsub("\\S+@\\S+\\s*", "", org_details_STM$description)
+  org_details_STM$description <- gsub("\\b\\d+\\b", "", org_details_STM$description)
+
+
+# Create a corpus from the description column
+description_corpus <- corpus(org_details_STM$description,
+                       docvars = org_details_STM[,colnames(org_details_STM) != "description"])
+
+#domain_stopwords <- c("service", "product", "company", "business", "organization", "platform", "solution", "industry", "customer", "team", "market", "users", "provide", "provides", "aims", "providing", "make", "system", "revolutionize", "leading", "trusted", "pioneer", "convenience", "clients", "innovative", "india", "india's", "help", "innovation", "founded", "world", "needs", "revolutionize", "products", "can", "india's", "future", "services", "solutions", "headquartered", "people", "brand", "believe", "offers", 'app', "mission", "vision", "problems", "solve", "cutting-edge", "growth", "expertise", "commitment", "achieve", "karnataka", "bangalore", "delhi", "chennai", "mumbai", "bengaluru")
+
+# Create a document-feature matrix
+description_dfm <- description_corpus %>%
+  tokens(remove_punct = TRUE, remove_symbols = TRUE,
+         remove_url = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en")) %>%
+  # Remove domain-specific stopwords
+  #tokens_remove(domain_stopwords) %>%
+  dfm() %>%
+  dfm_trim(min_termfreq = 5)
+
+# Check for empty documents
+sum(rowSums(description_dfm) == 0)
+
+# Remove empty documents
+description_dfm_non_empty <- description_dfm[rowSums(description_dfm) > 0, ]
+
+# Convert the quanteda dfm to a stm format
+stm_input <- convert(description_dfm_non_empty, to = "stm")
+
+# Find optimal number of topics using the searchK() function
+k_search_output <- searchK(stm_input$documents, stm_input$vocab, K = c(20:35), data = stm_input$meta, verbose = TRUE, heldout.seed = 123)
+
+k_search_output_1 <- searchK(stm_input$documents, stm_input$vocab, K = c(15:35), data = stm_input$meta, verbose = TRUE, heldout.seed = 123)
+
+# Save the searchK output
+saveRDS(k_search_output, "k_search_output.rds")
+
+# Plot the searchK output
+plot(k_search_output_1)
+
+# Create a dataframe from the searchK() output
+k_search_output_df <- data.frame(K = c(10:30), exclusivity = c(10:30), residual = c(10:30), semantic_coherence = c(10:30))
+# Extract the results from the searchK() output
+k_search_output_df$K <- unlist(k_search_output$results$K)
+k_search_output_df$exclusivity <- unlist(k_search_output$results$exclus)
+k_search_output_df$residual <- unlist(k_search_output$results$residual)
+k_search_output_df$semantic_coherence <- unlist(k_search_output$results$semcoh)
+
+
+# Save the dataframe
+#write.csv(k_search_output_df, "k_search_output_df_wo_domainwords.csv")
+
+
+# Plot a scatter plot for the exclusivity, residual and semantic coherence graphs in a row
+par(mfrow = c(1, 3))
+# Highlight topic number 17 across all these plots
+plot(k_search_output_df$K, k_search_output_df$exclusivity, type = "b", xlab = "Number of Topics (K)", ylab = "Exclusivity")
+plot(k_search_output_df$K, k_search_output_df$residual, type = "b", xlab = "Number of Topics (K)", ylab = "Residual")
+plot(k_search_output_df$K, k_search_output_df$semantic_coherence, type = "b", xlab = "Number of Topics (K)", ylab = "Semantic Coherence")
+
+# Apply the STM model with the optimal number of topics
+stmodel <- stm(documents = stm_input$documents, vocab = stm_input$vocab,
+               K = 26, data = stm_input$meta,
+               prevalence = ~ sector + industry,
+               max.em.its = 100,       # Increase the number of EM iterations
+               emtol = 1e-4,           # Lower the EM tolerance for more precise convergence
+               init.type = "Spectral",   # Change initialization method
+               gamma.prior = "L1",     # Apply L1 regularization
+               verbose = TRUE, 
+               seed = 123)
+
+
+# Plot the topics and their prevalence
+plot(stmodel, type = "summary", labeltype = "frex")
+
+# Find the top documents for each topic
+top_docs <- findThoughts(stmodel,
+                          texts = org_details_STM$description[which(rowSums(as.matrix(description_dfm)) > 0)],
+                          n = 5, topics = c(1:26))
+
+
+# Find top words for each topic
+labelTopics(stmodel, n = 10, c(1:26), frexweight = 0.5)
+
+
+# Save the stmodel_4
+#saveRDS(stmodel, "stmodel.rds")
+
+
+```
+
+Below code chunk uses the topic proportions from the STM model to assign a topic to each startup based on the highest proportion of the topic. The code also cleans the industry sector column to keep only the text after the colon. The cleaned industry sector column is used for further analysis.
+
+```{r, Topic Distribution, fig.width=10, fig.height=7}
+# Make dataframe of the prevalence of topics and STM metadata
+topicprop_meta_df <- make.dt(stmodel_4, stm_input$meta)
+
+# Remove the first column (document number) from the dataframe
+topicprop_meta_df <- topicprop_meta_df[, -1]
+
+# Change topic column names to custom names
+colnames(topicprop_meta_df)[1:26] <- c("T1:Logistics & Trasportation", "T2:Home & Utility", "T3:Real Estate & Venture Capitals", "T4:Social Community Building", "T5:Financing & Banking Services", "T6:Talent hiring & skilling", "T7:Digital Marketing & Web Development", "T8:Connectivity & Communication Solutions", "T9:Healthcare", "T10:Travel, Sports & Fitness", "T11:News, Media & Entertainment", "T12:Cloud & DeepTech", "T13:Robotics & Industrial Technology", "T14:Online Marketplace", "T15:EnterpriseTech  & Professional Services", "T16:Agriculture & Supply Chain", "T17:Insurance & Financial Investments", "T18:Fashion, Beauty & Retail", "T19:Limited Information", "T20:Data Analytics & AI", "T21:EdTech", "T22:Food & Beverage", "T23:Electric Mobility & Renewables", "T24:Software & Mobile Apps", "T25:Design & Graphics", "T26:E-Commerce & Consumer Technology")
+
+# Remove the first column (document number) from the dataframe
+topicprop_meta_df <- topicprop_meta_df[, -19]
+
+topicprop_meta_df$industry_sector <- colnames(topicprop_meta_df)[apply(topicprop_meta_df[, c(1:25)], 1, which.max)]
+# Only for the companies which got no industry assigned, assign them the second max topic
+# Clean the industry sector column
+# Keep only the text after the colon
+topicprop_meta_df$industry_sector <- gsub(".*:", "", topicprop_meta_df$industry_sector) %>% trimws()
+
+```
+
+Below code chunk defines the function to merge semester wise time-series data for startups and other relevant information. The function merges the startup data with competitor details, centrality measures, patent information, trademark information, funding success labels, and IPO/acquisition information. The function also updates the funding success label based on the IPO/acquisition information for each semester. The merged data frame is returned for further analysis and visualization.
+```{r}
+
+# Define the function to merge all the semester data for a given semester
+process_semester_data <- function(startup_df, competitor_details_df, centrality_df, patents_df, trademark_df, funding_success_df, sem_ipo_acq_df) {
+  
+  # Merge startup_df with competitor_details_df
+  merged_df <- merge(startup_df, competitor_details_df, by = "name", all.x = TRUE)
+  
+  # Merge merged_df with closeness_df
+  merged_df <- merge(merged_df, centrality_df, by = "entity", all.x = TRUE)
+  
+  # Merge merged_df with patents_df
+  merged_df <- merge(merged_df, patents_df, by="name", all.x = TRUE)
+  
+  # Merge merged_df with trademarks_df
+  merged_df <- merge(merged_df, trademark_df, by.x="uuid", by.y="crunchbase_uuid", all.x = TRUE)
+  
+  # initialize the funding_success column
+  merged_df$funding_success <- NA
+  
+  # Create a new column to capture the funding success label if the entity is a match
+  for (i in 1:nrow(merged_df)) {
+    if (merged_df$entity[i] %in% funding_success_df$entity) {
+      merged_df$funding_success[i] <- 1
+    } else {
+      merged_df$funding_success[i] <- 0
+    }
+  }
+  #merged_df$funding_success <- ifelse(merged_df$entity %in% funding_success_df$entity, 1, 0)
+  
+  # if the entities are in the sem_ipo_acq_df, then make sure the funding_success is 1 for those corresponding entities
+  for (i in 1:nrow(merged_df)) {
+    if (merged_df$entity[i] %in% sem_ipo_acq_df$entity) {
+      merged_df$funding_success[i] <- 1
+    }
+  }
+  
+  return(merged_df)
+}
+
+sem1_df <- process_semester_data(sem1_startup_df, sem1_competitor_details_df, sem1_centrality_df, sem1_patent_df, sem1_trademark_df, sem1_funding_success_df, sem1_ipo_acq_df)
+
+sem2_df <- process_semester_data(sem2_startup_df, sem2_competitor_details_df, sem2_centrality_df, sem2_patent_df, sem2_trademark_df, sem2_funding_success_df, sem2_ipo_acq_df)
+
+sem3_df <- process_semester_data(sem3_startup_df, sem3_competitor_details_df, sem3_centrality_df, sem3_patent_df, sem3_trademark_df, sem3_funding_success_df, sem3_ipo_acq_df)
+
+sem4_df <- process_semester_data(sem4_startup_df, sem4_competitor_details_df, sem4_centrality_df, sem4_patent_df, sem4_trademark_df, sem4_funding_success_df, sem4_ipo_acq_df)
+
+sem5_df <- process_semester_data(sem5_startup_df, sem5_competitor_details_df, sem5_centrality_df, sem5_patent_df, sem5_trademark_df, sem5_funding_success_df, sem5_ipo_acq_df)
+
+sem6_df <- process_semester_data(sem6_startup_df, sem6_competitor_details_df, sem6_centrality_df, sem6_patent_df, sem6_trademark_df, sem6_funding_success_df, sem6_ipo_acq_df)
+
+sem7_df <- process_semester_data(sem7_startup_df, sem7_competitor_details_df, sem7_centrality_df, sem7_patent_df, sem7_trademark_df, sem7_funding_success_df, sem7_ipo_acq_df)
+
+sem8_df <- process_semester_data(sem8_startup_df, sem8_competitor_details_df, sem8_centrality_df, sem8_patent_df, sem8_trademark_df, sem8_funding_success_df, sem8_ipo_acq_df)
+
+sem9_df <- process_semester_data(sem9_startup_df, sem9_competitor_details_df, sem9_centrality_df, sem9_patent_df, sem9_trademark_df, sem9_funding_success_df, sem9_ipo_acq_df)
+
+sem10_df <- process_semester_data(sem10_startup_df, sem10_competitor_details_df, sem10_centrality_df, sem10_patent_df, sem10_trademark_df, sem10_funding_success_df, sem10_ipo_acq_df)
+
+sem11_df <- process_semester_data(sem11_startup_df, sem11_competitor_details_df, sem11_centrality_df, sem11_patent_df, sem11_trademark_df, sem11_funding_success_df, sem11_ipo_acq_df)
+
+sem12_df <- process_semester_data(sem12_startup_df, sem12_competitor_details_df, sem12_centrality_df, sem12_patent_df, sem12_trademark_df, sem12_funding_success_df, sem12_ipo_acq_df)
+
+sem13_df <- process_semester_data(sem13_startup_df, sem13_competitor_details_df, sem13_centrality_df, sem13_patent_df, sem13_trademark_df, sem13_funding_success_df, sem13_ipo_acq_df)
+
+sem14_df <- process_semester_data(sem14_startup_df, sem14_competitor_details_df, sem14_centrality_df, sem14_patent_df, sem14_trademark_df, sem14_funding_success_df, sem14_ipo_acq_df)
+
+sem15_df <- process_semester_data(sem15_startup_df, sem15_competitor_details_df, sem15_centrality_df, sem15_patent_df, sem15_trademark_df, sem15_funding_success_df, sem15_ipo_acq_df)
+
+sem16_df <- process_semester_data(sem16_startup_df, sem16_competitor_details_df, sem16_centrality_df, sem16_patent_df, sem16_trademark_df, sem16_funding_success_df, sem16_ipo_acq_df)
+
+sem17_df <- process_semester_data(sem17_startup_df, sem17_competitor_details_df, sem17_centrality_df, sem17_patent_df, sem17_trademark_df, sem17_funding_success_df, sem17_ipo_acq_df)
+
+sem18_df <- process_semester_data(sem18_startup_df, sem18_competitor_details_df, sem18_centrality_df, sem18_patent_df, sem18_trademark_df, sem18_funding_success_df, sem18_ipo_acq_df)
+
+sem19_df <- process_semester_data(sem19_startup_df, sem19_competitor_details_df, sem19_centrality_df, sem19_patent_df, sem19_trademark_df, sem19_funding_success_df, sem19_ipo_acq_df)
+
+
+```
+
+Below code chunk defines the function to identify the companies that closed down or got acquired within a particular semester of consideration and are removed from the sample.
+
+```{r}
+#--------------------------------------------------------------------------------------
+# Filter companies with status as Closed or Was_acquired
+closed_or_acquired <- org_details[which(org_details$status %in% c("closed", "was_acquired")), c("name", "status", "founded_on_date", "closed_on_date", "exited_on_date")]
+
+# Find the companies that close down within a semester, following each semester of funding
+closed_within_sem <- function(date) {
+  # Find the companies that closed down within a given semester
+  closed_companies <- closed_or_acquired[which(closed_or_acquired$closed_on_date >= date & closed_or_acquired$closed_on_date <= date + months(6) | closed_or_acquired$exited_on_date >= date & closed_or_acquired$exited_on_date <= date + months(6)),]
+  return(closed_companies)
+}
+
+sem1_closed_companies <- closed_within_sem(as.Date("2022-01-01"))
+
+sem2_closed_companies <- closed_within_sem(as.Date("2021-07-01"))
+
+sem3_closed_companies <- closed_within_sem(as.Date("2021-01-01"))
+
+sem4_closed_companies <- closed_within_sem(as.Date("2020-07-01"))
+
+sem5_closed_companies <- closed_within_sem(as.Date("2020-01-01"))
+
+sem6_closed_companies <- closed_within_sem(sem6_end_date)
+
+sem7_closed_companies <- closed_within_sem(sem7_end_date)
+
+sem8_closed_companies <- closed_within_sem(sem8_end_date)
+
+sem9_closed_companies <- closed_within_sem(sem9_end_date)
+
+sem10_closed_companies <- closed_within_sem(sem10_end_date)
+
+sem11_closed_companies <- closed_within_sem(sem11_end_date)
+
+sem12_closed_companies <- closed_within_sem(sem12_end_date)
+
+sem13_closed_companies <- closed_within_sem(sem13_end_date)
+
+sem14_closed_companies <- closed_within_sem(sem14_end_date)
+
+sem15_closed_companies <- closed_within_sem(sem15_end_date)
+
+sem16_closed_companies <- closed_within_sem(sem16_end_date)
+
+sem17_closed_companies <- closed_within_sem(sem17_end_date)
+
+sem18_closed_companies <- closed_within_sem(sem18_end_date)
+
+sem19_closed_companies <- closed_within_sem(sem19_end_date)
+
+
+# Remove the closed/acquired companies from the sem_df
+
+sem1_df <- sem1_df[!sem1_df$name %in% sem1_closed_companies$name,]
+sem2_df <- sem2_df[!sem2_df$name %in% sem2_closed_companies$name,]
+sem3_df <- sem3_df[!sem3_df$name %in% sem3_closed_companies$name,]
+sem4_df <- sem4_df[!sem4_df$name %in% sem4_closed_companies$name,]
+sem5_df <- sem5_df[!sem5_df$name %in% sem5_closed_companies$name,]
+sem6_df <- sem6_df[!sem6_df$name %in% sem6_closed_companies$name,]
+sem7_df <- sem7_df[!sem7_df$name %in% sem7_closed_companies$name,]
+sem8_df <- sem8_df[!sem8_df$name %in% sem8_closed_companies$name,]
+sem9_df <- sem9_df[!sem9_df$name %in% sem9_closed_companies$name,]
+sem10_df <- sem10_df[!sem10_df$name %in% sem10_closed_companies$name,]
+sem11_df <- sem11_df[!sem11_df$name %in% sem11_closed_companies$name,]
+sem12_df <- sem12_df[!sem12_df$name %in% sem12_closed_companies$name,]
+sem13_df <- sem13_df[!sem13_df$name %in% sem13_closed_companies$name,]
+sem14_df <- sem14_df[!sem14_df$name %in% sem14_closed_companies$name,]
+sem15_df <- sem15_df[!sem15_df$name %in% sem15_closed_companies$name,]
+sem16_df <- sem16_df[!sem16_df$name %in% sem16_closed_companies$name,]
+sem17_df <- sem17_df[!sem17_df$name %in% sem17_closed_companies$name,]
+sem18_df <- sem18_df[!sem18_df$name %in% sem18_closed_companies$name,]
+sem19_df <- sem19_df[!sem19_df$name %in% sem19_closed_companies$name,]
+
+
+#--------------------------------------------------------------------------------------
+
+```
+
+Below code chunk defines the function to merge data from all semesters and perform the necessary transformations to the features. The function also adds the city and state columns to the merged data frame and assigns the industry sector based on the topic proportions. The function also loads the NA founders data from the CSV file and adds the number of founders to the merged data frame. The merged data frame is then split into pre-seed, seed, Series A, Series B funding data for further analysis and visualization. The merged data frames are saved to CSV files for future reference. 
+
+```{r, merging}
+# All funding data
+merged_df <- rbind(sem1_df, sem2_df, sem3_df, sem4_df, sem5_df, sem6_df, sem7_df, sem8_df, sem9_df, sem10_df, sem11_df, sem12_df, sem13_df, sem14_df, sem15_df, sem16_df, sem17_df, sem18_df, sem19_df) %>% mutate(num_patents = ifelse(is.na(num_patents), 0, num_patents)) %>% mutate(num_trademarks = ifelse(is.na(num_trademarks), 0, num_trademarks))  %>% mutate(prop_female_founders = ifelse(is.na(prop_female_founders), 0, prop_female_founders)) # Make all columns numeric except for the funding_success column
+
+
+# Add the city and state columns to the merged_df
+merged_df$city <- org_details$city[match(merged_df$name, org_details$name)]
+merged_df$state <- org_details$state[match(merged_df$name, org_details$name)]
+
+# Remove instances with neagtive days_since_founded
+merged_df <- merged_df[which(merged_df$days_since_founded >= 0),]
+
+# Load the NA founders data from the CSV file
+NA_founders_df <- read_csv("NA_founders.csv")
+
+# Add num_founders if the name is a match in the merged_df
+for (i in 1:nrow(merged_df)) {
+  if (merged_df$name[i] %in% NA_founders_df$startup) {
+    merged_df$num_founders[i] <- NA_founders_df$num_founders[which(NA_founders_df$startup == merged_df$name[i])]
+  }
+}
+
+
+# Match names with org_details and assign the industry sector 
+merged_df$industry_sector <- topicprop_meta_df$industry_sector[match(merged_df$name, topicprop_meta_df$name)]
+
+# Pre-seed funding data
+pre_seed_merged_df <- merged_df %>% filter(funding_round_type == "pre_seed")
+
+# Pre-Seed and Seed funding data 
+seed_merged_df <- merged_df %>% filter(funding_round_type %in% c("pre_seed", "seed"))
+
+# Series A funding data
+series_a_merged_df <- merged_df %>% filter(funding_round_type == "series_a")
+
+# Series B funding data
+series_b_merged_df <- merged_df %>% filter(funding_round_type == "series_b")
+
+#Save the files to CSV
+write_csv(merged_df, path = "merged_df_oldsuccess_newcentrality.csv")
+write_csv(pre_seed_merged_df, path = "pre_seed_merged_df.csv")
+write_csv(seed_merged_df, path = "seed_merged_df.csv")
+write_csv(series_a_merged_df, path = "series_a_merged_df.csv")
+write_csv(series_b_merged_df, path = "series_b_merged_df.csv")
+
+# load merged_df
+merged_df <- read_csv("merged_df.csv")
+merged_df <- read_csv("merged_df_030820204.csv")
+merged_df <- read_csv("merged_df_oldsuccess_newcentrality.csv")
+
+#-----------------------------------------------------------------------------------
+
+library(fastDummies)
+
+prediction_dataset <- function (merged_df) {
+ # Select relevant columns and transform data types
+  sem_funding <- merged_df %>% 
+    select(city, state, industry_sector, num_investors, funding_total, num_funding_rounds, num_founders, prop_female_founders, num_prev_startups, last_round_funding, days_since_founded, days_since_last_funding, num_articles, max_betweenness_centrality, mean_degree_centrality, max_eigenvector_centrality, avg_comp_funding, count, prop_comp_raised_funds, num_patents, num_trademarks, funding_success) %>% 
+    mutate_at(vars(-c(funding_success, state, city, industry_sector)), as.numeric) %>% 
+    mutate_at(vars(funding_success), as.factor) %>% mutate_at(vars(city, state, industry_sector), as.character)
+  
+  # State, City Dummy Variable Transformations
+  sem_funding$state[is.na(sem_funding$state)] <- "Missing"
+  sem_funding <- sem_funding %>% 
+    dummy_cols(select_columns = c("state", "industry_sector")) %>% 
+    select(-c(city, state, industry_sector))
+  
+  # Add underscores in place of spaces in column names
+  colnames(sem_funding) <- gsub(" ", "_", colnames(sem_funding))
+  
+  return(sem_funding)
+}
+
+all_funding <- prediction_dataset(merged_df)
+preseed_funding <- prediction_dataset(pre_seed_merged_df)
+seed_funding <- prediction_dataset(seed_merged_df)
+seriesa_funding <- prediction_dataset(series_a_merged_df)
+seriesb_funding <- prediction_dataset(series_b_merged_df)
+seriesc_funding <- prediction_dataset(series_c_merged_df)
+seriesd_funding <- prediction_dataset(series_d_merged_df)
+
+# Save the datasets to CSV files
+write_csv(all_funding, path = "all_funding.csv")
+#write_csv(seed_funding, path = "seed_funding.csv")
+#write_csv(seriesa_funding, path = "seriesa_funding.csv")
+#write_csv(seriesb_funding, path = "seriesb_funding.csv")
+#write_csv(seriesc_funding, path = "seriesc_funding.csv")
+#write_csv(seriesd_funding, path = "seriesd_funding.csv")
+
+all_funding <- read_csv("all_funding.csv")
+
+```
+
+
+Below code chunk defines the function to preprocess the data for the xgboost model. The function performs log transformation and min-max scaling on the specified columns. The data is then split into training and testing sets for each multi-stage model. Further, training and test sets are created by removing the competition, investor centrality, and IP columns to facilitate the ablation study. The preprocessed data is returned as a list containing the training and testing sets. 
+
+```{r, xgboost}
+
+#install.packages("missRanger")
+library(missRanger)
+
+preprocess_data <- function(funding_df) {
+  
+  # Clean the colnames for industry_sector
+  colnames(funding_df)<- gsub("industry_sector_", "", colnames(funding_df))
+  colnames(funding_df)<- gsub(",", "", colnames(funding_df))
+  colnames(funding_df)<- gsub("-", "", colnames(funding_df))
+  colnames(funding_df)<- gsub("&_", "", colnames(funding_df))
+  
+  # Log transform certain columns, ignoring NAs
+  log_transform_columns <- c("avg_comp_funding", "count", "funding_total", "last_round_funding", "num_articles", "num_investors","num_patents", "num_trademarks", "days_since_last_funding", "days_since_founded")
+  funding_df[, log_transform_columns] <- lapply(funding_df[, log_transform_columns], function(x) ifelse(is.na(x) | x < 0, NA, log1p(x)))
+  
+  # Apply min-max scaling to some of the columns
+  min_max_columns <- c("num_founders", "num_funding_rounds", "num_prev_startups", "num_investors", "num_articles", "count", "days_since_last_funding", "days_since_founded", "max_betweenness_centrality", "mean_degree_centrality")
+  funding_df[, min_max_columns] <- lapply(funding_df[, min_max_columns], function(x) ifelse(is.na(x), NA, (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))))
+  
+  # Randomly split the data into training and testing sets
+  set.seed(123)
+  train_index <- sample(1:nrow(funding_df), 0.8 * nrow(funding_df))
+  train_all <- funding_df[train_index, ]
+  test_all <- funding_df[-train_index, ]
+    
+  return(list(train_scaled = train_all, test_scaled = test_all))
+}
+
+# Example usage:
+result_all <- preprocess_data(all_funding)
+train_all_scaled <- as.data.frame(result_all$train_scaled)
+test_all_scaled <- as.data.frame(result_all$test_scaled)
+
+# Remove specific columns from the training and testing sets
+train_all_wo_comp <- train_all_scaled[, !colnames(train_all_scaled) %in% c("count", "avg_comp_funding", "prop_comp_raised_funds")]
+test_all_wo_comp <- test_all_scaled[, !colnames(test_all_scaled) %in% c("count", "avg_comp_funding", "prop_comp_raised_funds")]
+
+train_all_wo_invcentrality <- train_all_scaled[, !colnames(train_all_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+test_all_wo_invcentrality <- test_all_scaled[, !colnames(test_all_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+
+train_all_wo_patents <- train_all_scaled[, !colnames(train_all_scaled) %in% c("num_patents", "num_trademarks")]
+test_all_wo_patents <- test_all_scaled[, !colnames(test_all_scaled) %in% c("num_patents", "num_trademarks")]
+
+
+#-----------------------------------------------------------------------
+
+
+# Scale the train and test data separately to avoid data leakage, use the mean and standard deviation of the training data to scale the test data
+
+results_seed <- preprocess_data(seed_funding)
+train_seed_scaled <- as.data.frame(results_seed$train_scaled)
+test_seed_scaled <- as.data.frame(results_seed$test_scaled)
+
+# save train seed scaled
+write_csv(train_seed_scaled, path = "train_seed_scaled.csv")
+
+# Remove specific columns from the training and testing sets
+train_seed_wo_comp <- train_seed_scaled[, !colnames(train_seed_scaled) %in% c("count", "avg_comp_funding", "prop_comp_raised_funds")]
+test_seed_wo_comp <- test_seed_scaled[, !colnames(test_seed_scaled) %in% c("count", "avg_comp_funding","prop_comp_raised_funds")]
+
+train_seed_wo_invcentrality <- train_seed_scaled[, !colnames(train_seed_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+test_seed_wo_invcentrality <- test_seed_scaled[, !colnames(test_seed_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+
+train_seed_wo_patents <- train_seed_scaled[, !colnames(train_seed_scaled) %in% c("num_patents", "num_trademarks")]
+test_seed_wo_patents <- test_seed_scaled[, !colnames(test_seed_scaled) %in% c("num_patents", "num_trademarks")]
+
+# ------------------------------------------------------------------
+#Split the series A data into training and testing sets
+
+results_seriesa <- preprocess_data(seriesa_funding)
+train_seriesa_scaled <- as.data.frame(results_seriesa$train_scaled)
+test_seriesa_scaled <- as.data.frame(results_seriesa$test_scaled)
+
+# Remove specific columns from the training and testing sets
+train_seriesa_wo_comp <- train_seriesa_scaled[, !colnames(train_seriesa_scaled) %in% c("count", "avg_comp_funding", "comp_last_round_funding")]
+test_seriesa_wo_comp <- test_seriesa_scaled[, !colnames(test_seriesa_scaled) %in% c("count", "avg_comp_funding", "comp_last_round_funding")]
+
+train_seriesa_wo_invcentrality <- train_seriesa_scaled[, !colnames(train_seriesa_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+test_seriesa_wo_invcentrality <- test_seriesa_scaled[, !colnames(test_seriesa_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+
+train_seriesa_wo_patents <- train_seriesa_scaled[, !colnames(train_seriesa_scaled) %in% c("num_patents", "num_trademarks")]
+test_seriesa_wo_patents <- test_seriesa_scaled[, !colnames(test_seriesa_scaled) %in% c("num_patents", "num_trademarks")]
+
+# ------------------------------------------------------------------
+
+#Split the series B data into training and testing sets
+
+results_seriesb_scaled <- preprocess_data(seriesb_funding)
+train_seriesb_scaled <- as.data.frame(results_seriesb_scaled$train_scaled)
+test_seriesb_scaled <- as.data.frame(results_seriesb_scaled$test_scaled)
+
+# Remove specific columns from the training and testing sets
+train_seriesb_wo_comp <- train_seriesb_scaled[, !colnames(train_seriesb_scaled) %in% c("count", "avg_comp_funding", "comp_last_round_funding")]
+test_seriesb_wo_comp <- test_seriesb_scaled[, !colnames(test_seriesb_scaled) %in% c("count", "avg_comp_funding", "comp_last_round_funding")]
+
+train_seriesb_wo_invcentrality <- train_seriesb_scaled[, !colnames(train_seriesb_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+test_seriesb_wo_invcentrality <- test_seriesb_scaled[, !colnames(test_seriesb_scaled) %in% c("num_investors", "max_betweenness_centrality", "mean_degree_centrality", "max_eigenvector_centrality")]
+
+train_seriesb_wo_patents <- train_seriesb_scaled[, !colnames(train_seriesb_scaled) %in% c("num_patents", "num_trademarks")]
+test_seriesb_wo_patents <- test_seriesb_scaled[, !colnames(test_seriesb_scaled) %in% c("num_patents", "num_trademarks")]
+
+# ------------------------------------------------------------------
+
+
+```
+
+
+Below code chunk defines the function to train the xgboost model on the preprocessed data. The function trains the model on the training data and evaluates the model on the test data. The function returns the model and the evaluation results. 
+
+Note: The tuned parameters used for the mutli-stage models are obtained using Bayesian optimization performed in Pyhton.
+
+```{r, xgboost}
+# ------------------------------------------------------------------------------------------------------------
+
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create training and test tasks
+train_all_task <- makeClassifTask(data = train_all_scaled, target = "funding_success", positive = "1")
+test_all_task <- makeClassifTask(data = test_all_scaled, target = "funding_success", positive = "1")
+
+train_all_task_wo_comp <- makeClassifTask(data = train_all_wo_comp, target = "funding_success", positive = "1")
+test_all_task_wo_comp <- makeClassifTask(data = test_all_wo_comp, target = "funding_success", positive = "1")
+
+train_all_task_wo_invcentrality <- makeClassifTask(data = train_all_wo_invcentrality, target = "funding_success", positive = "1")
+test_all_task_wo_invcentrality <- makeClassifTask(data = test_all_wo_invcentrality, target = "funding_success", positive = "1")
+
+train_all_task_wo_patents <- makeClassifTask(data = train_all_wo_patents, target = "funding_success", positive = "1")
+test_all_task_wo_patents <- makeClassifTask(data = test_all_wo_patents, target = "funding_success", positive = "1")
+
+
+#----------------------Seed----------------------------------------
+train_task_seed <- makeClassifTask(data = train_seed_scaled, target = "funding_success", positive = "1")
+test_task_seed <- makeClassifTask(data = test_seed_scaled, target = "funding_success", positive = "1")
+
+train_seed_task_wo_comp <- makeClassifTask(data = train_seed_wo_comp, target = "funding_success", positive = "1")
+test_seed_task_wo_comp <- makeClassifTask(data = test_seed_wo_comp, target = "funding_success", positive = "1")
+
+train_seed_task_wo_invcentrality <- makeClassifTask(data = train_seed_wo_invcentrality, target = "funding_success", positive = "1")
+test_seed_task_wo_invcentrality <- makeClassifTask(data = test_seed_wo_invcentrality, target = "funding_success", positive = "1")
+
+train_seed_task_wo_patents <- makeClassifTask(data = train_seed_wo_patents, target = "funding_success", positive = "1")
+test_seed_task_wo_patents <- makeClassifTask(data = test_seed_wo_patents, target = "funding_success", positive = "1")
+
+#----------------------Series A----------------------------------------
+
+train_task_seriesa <- makeClassifTask(data = train_seriesa_scaled, target = "funding_success")
+test_task_seriesa <- makeClassifTask(data = test_seriesa_scaled, target = "funding_success")
+
+train_seriesa_task_wo_comp <- makeClassifTask(data = train_seriesa_wo_comp, target = "funding_success")
+test_seriesa_task_wo_comp <- makeClassifTask(data = test_seriesa_wo_comp, target = "funding_success")
+
+train_seriesa_task_wo_invcentrality <- makeClassifTask(data = train_seriesa_wo_invcentrality, target = "funding_success")
+test_seriesa_task_wo_invcentrality <- makeClassifTask(data = test_seriesa_wo_invcentrality, target = "funding_success")
+
+train_seriesa_task_wo_patents <- makeClassifTask(data = train_seriesa_wo_patents, target = "funding_success")
+test_seriesa_task_wo_patents <- makeClassifTask(data = test_seriesa_wo_patents, target = "funding_success")
+
+#----------------------Series B----------------------------------------
+
+train_task_seriesb <- makeClassifTask(data = train_seriesb_scaled, target = "funding_success")
+test_task_seriesb <- makeClassifTask(data = test_seriesb_scaled, target = "funding_success")
+
+train_seriesb_task_wo_comp <- makeClassifTask(data = train_seriesb_wo_comp, target = "funding_success")
+test_seriesb_task_wo_comp <- makeClassifTask(data = test_seriesb_wo_comp, target = "funding_success")
+
+train_seriesb_task_wo_invcentrality <- makeClassifTask(data = train_seriesb_wo_invcentrality, target = "funding_success")
+test_seriesb_task_wo_invcentrality <- makeClassifTask(data = test_seriesb_wo_invcentrality, target = "funding_success")
+
+train_seriesb_task_wo_patents <- makeClassifTask(data = train_seriesb_wo_patents, target = "funding_success")
+test_seriesb_task_wo_patents <- makeClassifTask(data = test_seriesb_wo_patents, target = "funding_success")
+
+
+#--------------------------------------------------------------------------
+# Define the positive class ratio
+pos_class_ratio <- table(train_all_scaled$funding_success)[1] / table(train_all_scaled$funding_success)[2]
+
+pos_class_ratio_preseed <- table(train_preseed_scaled$funding_success)[1] / table(train_preseed_scaled$funding_success)[2]
+
+pos_class_ratio_seed <- table(train_seed_scaled$funding_success)[1] / table(train_seed_scaled$funding_success)[2]
+
+pos_class_ratio_seriesa <- table(train_seriesa_scaled$funding_success)[1] / table(train_seriesa_scaled$funding_success)[2]
+
+pos_class_ratio_seriesb <- table(train_seriesb_scaled$funding_success)[1] / table(train_seriesb_scaled$funding_success)[2]
+
+#--------------------------------------------------------------------------
+
+# Tune all funding model
+
+# Tune the xgboost model using mlr
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.0245,
+  max_depth = 8,
+  min_child_weight = 5,
+  gamma = 0.3,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  nthread = 6,
+  nrounds = 2000,
+  alpha = 3,
+  lambda = 0,
+  scale_pos_weight = pos_class_ratio,
+  verbose = 1,
+  early_stopping_rounds = 15
+)
+
+# Create xgboost learner
+xgb <- makeLearner("classif.xgboost", predict.type = "prob", par.vals = xgb_params)
+
+# Set the parameters for xgboost
+xgbparams <- makeParamSet(
+  makeNumericParam("eta", lower = 0.001L ,upper = 0.3L),
+  makeIntegerParam("max_depth",lower = 5L,upper = 15L), 
+  makeIntegerParam("min_child_weight",lower = 1L,upper = 10L),
+  makeDiscreteParam("subsample", values = c(0.5, 0.6, 0.7, 0.8)),
+  makeDiscreteParam("colsample_bytree", values = c(0.5, 0.6, 0.7, 0.8, 0.9)),
+  makeNumericParam("gamma",lower = 0, upper = 3),
+  makeNumericParam("alpha", lower = 0, upper = 6),
+  makeNumericParam("lambda", lower = 0, upper = 6),
+  makeIntegerParam("nrounds",lower = 500L,upper = 5000L),
+  makeDiscreteParam("early_stopping_rounds", values = c(10, 12, 15, 18, 20))
+  )
+
+# Set the control parameters
+ctrl_xgb <- makeTuneControlRandom(maxit = 20L)
+
+# Set the cross-validation  parameters
+set_cv_xgb <- makeResampleDesc("CV", stratify=T, iters = 7L)
+
+measures <- list(mlr::auc, mlr::mmce)
+
+# Tune the xgboost parameters
+xgb_tune <- mlr::tuneParams(learner = xgb, task = train_all_task, resampling = set_cv_xgb, par.set = xgbparams, control = ctrl_xgb, show.info = T, measures = measures)
+
+# Define function to evaluate the model and extract performance metrics from predicted probabilities and classes 
+evaluate_xgb_model <- function(xgb_model, test_data, test_labels) {
+  # Predict on the test data
+  xgb_pred <- predict(xgb_model, newdata = test_data)
+  
+  plot(PRROC::pr.curve(xgb_pred$data$prob.1, xgb_pred$data$prob.0, curve = T))
+  # Save the plot
+  #plot_name <- paste0("pr_curve_", format(Sys.time(), "%Y%m%d%H%M%S"), ".png")
+  #ggsave(plot_name)
+  
+  # Calculate the AUC
+  #aucpr <- pr.curve(xgb_pred$data$prob.1, test_labels, curve = T)$auc.integral
+  #plot(pr.curve(xgb_pred$data$prob.1, test_labels, curve = T))
+  aucpr <- MLmetrics::PRAUC(xgb_pred$data$prob.1, as.numeric(test_labels))
+  # Calculate the AUC
+  auc <- performance(xgb_pred, measures = mlr::auc)
+  
+  # Extract prediction data
+  pred_data <- xgb_pred$data
+  
+  # Calculate F1 score
+  f1_score <- F1_Score(pred_data$response, test_labels)
+  
+  # Calculate the confusion matrix
+  confusion_matrix <- caret::confusionMatrix(pred_data$response, test_labels, positive = "1")
+  
+  # Extract overall precision and recall
+  precision <- confusion_matrix$byClass["Pos Pred Value"]
+  recall <- confusion_matrix$byClass["Sensitivity"]
+  accuracy <- confusion_matrix$overall["Accuracy"]
+
+  
+  # Order the predictions based on prob.1 column
+  top_100 <- order(pred_data$prob.1, decreasing = TRUE)[1:100]
+  top_50 <- order(pred_data$prob.1, decreasing = TRUE)[1:50]
+  
+  # Get the top 100 predictions and their true labels
+  top_100_predictions <- pred_data$response[top_100]
+  top_100_truth <- pred_data$truth[top_100]
+  
+  # Get the top 50 predictions and their true labels
+  top_50_predictions <- pred_data$response[top_50]
+  top_50_truth <- pred_data$truth[top_50]
+  
+  # Create confusion matrices for top 100 and top 50
+  conf_matrix_100 <- confusionMatrix(as.factor(top_100_predictions), as.factor(top_100_truth), positive = "1")
+  conf_matrix_50 <- confusionMatrix(as.factor(top_50_predictions), as.factor(top_50_truth), positive = "1")
+  
+  # Extract precision from the confusion matrices
+  p100 <- conf_matrix_100$byClass["Pos Pred Value"]
+  p50 <- conf_matrix_50$byClass["Pos Pred Value"]
+  
+# Debugging: Print the variables before returning the list
+  print(list(
+    Accuracy = accuracy,
+    F1_Score = f1_score,
+    Precision_At_Top_100 = p100,
+    Precision_At_Top_50 = p50,
+    Overall_Precision = precision,
+    Recall = recall,
+    PR_AUC = aucpr,
+    AUC = auc
+  ))
+  
+  # Return the evaluation metrics as a list
+  list(
+    Accuracy = accuracy,
+    F1_Score = f1_score,
+    Precision_At_Top_100 = p100,
+    Precision_At_Top_50 = p50,
+    Overall_Precision = precision,
+    Recall = recall,
+    PR_AUC = aucpr,
+    AUC = auc
+  )
+} 
+
+# Define function to iterate the training and evaluation process and store the mean results
+train_and_evaluate <- function(train_task, test_data, test_labels, xgb_params, n_repeats = 3) {
+  results <- list()
+  last_model <- NULL
+  
+  
+  for (i in 1:n_repeats) {
+    # Train the model
+    xgb_model <- mlr::train(xgb_params, train_task)
+    # Evaluate the model
+    results[[i]] <- evaluate_xgb_model(xgb_model, test_data, test_labels)
+    Sys.sleep(2)
+    
+    # Save the last model
+    if (i == n_repeats) {
+      last_model <- xgb_model
+    }
+  }
+  
+  # Combine the results into a single data frame
+  results_df <- do.call(rbind, lapply(results, as.data.frame))
+  
+  # Calculate the mean of the results
+  mean_results <- results_df %>%
+    summarise_all(mean)
+  
+  # Extract the xgboost model
+  xgboost_model <- getLearnerModel(last_model, more.unwrap = TRUE)
+  
+  return(list(mean_results = mean_results, last_model = xgboost_model))
+}
+
+# -----------------------------ALL-FUNDING-------------------------
+
+
+write_csv(train_all_scaled, path = "train_all_scaled.csv")
+set.seed(33)
+# List the tuned params
+xgb_tuned_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  eta = 0.005,
+  max_depth = 5,
+  min_child_weight = 2,
+  gamma = 2.5,
+  subsample = 0.8,
+  colsample_bytree = 0.6,
+  nrounds = 3000,
+  scale_pos_weight = pos_class_ratio,
+  verbose = 1,
+  early_stopping_rounds = 20
+)
+
+# Train the model with tuned params
+xgb_tuned <- makeLearner("classif.xgboost", predict.type = "prob", par.vals = xgb_tuned_params)
+
+results_af <- train_and_evaluate(train_all_task, test_all_scaled, as.factor(test_all_scaled$funding_success), xgb_tuned, n_repeats = 3)
+all_funding_results <- results_af$mean_results
+all_funding_model <- results_af$last_model
+
+results_wo_comp_af <- train_and_evaluate(train_all_task_wo_comp, test_all_wo_comp, as.factor(test_all_wo_comp$funding_success), xgb_tuned, n_repeats = 3)
+all_funding_results_wo_comp <- results_wo_comp_af$mean_results
+all_funding_model_wo_comp <- results_wo_comp_af$last_model
+
+results_wo_invcentrality_af <- train_and_evaluate(train_all_task_wo_invcentrality, test_all_wo_invcentrality, as.factor(test_all_wo_invcentrality$funding_success), xgb_tuned, n_repeats = 3)
+all_funding_results_wo_invcentrality <- results_wo_invcentrality_af$mean_results
+all_funding_model_wo_invcentrality <- results_wo_invcentrality_af$last_model
+
+results_wo_patents_af <- train_and_evaluate(train_all_task_wo_patents, test_all_wo_patents, as.factor(test_all_wo_patents$funding_success), xgb_tuned, n_repeats = 3)
+all_funding_results_wo_patents <- results_wo_patents_af$mean_results
+all_funding_model_wo_patents <- results_wo_patents_af$last_model
+
+# Create a table to compare the results for each model
+all_funding_results_table <- rbind(
+  all_funding_results,
+  all_funding_results_wo_comp,
+  all_funding_results_wo_invcentrality,
+  all_funding_results_wo_patents
+)
+
+# Save the all_funding_results_table as csv file
+write.csv(all_funding_results_table, "../all_funding_results_table.csv")
+
+
+#----------------------------SEED FUNDING-------------------------------
+
+# Tune the xgboost model for seed funding data
+
+xgb_params_seed  <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.01,
+  max_depth = 5,
+  min_child_weight = 6,
+  gamma = 3.5,
+  subsample = 0.7,
+  colsample_bytree = 0.6,
+  nrounds = 1800,
+  #alpha = 2.5,
+  #lambda = 2,
+  scale_pos_weight = pos_class_ratio_seed,
+  verbose = 1,
+  early_stopping_rounds = 12
+)
+
+# Create xgboost learner
+xgb_tuned_seed <- makeLearner("classif.xgboost", predict.type = "prob", par.vals = xgb_params_seed)
+
+set.seed(33)
+results_seed <- train_and_evaluate(train_task_seed, test_seed_scaled, as.factor(test_seed_scaled$funding_success), xgb_tuned_seed, n_repeats = 3)
+seed_funding_results <- results_seed$mean_results
+seed_funding_model <- results_seed$last_model
+
+results_seed_wo_comp <- train_and_evaluate(train_seed_task_wo_comp, test_seed_wo_comp, as.factor(test_seed_wo_comp$funding_success), xgb_tuned_seed, n_repeats = 3)
+seed_funding_results_wo_comp <- results_seed_wo_comp$mean_results
+seed_funding_model_wo_comp <- results_seed_wo_comp$last_model
+
+results_seed_wo_invcentrality <- train_and_evaluate(train_seed_task_wo_invcentrality, test_seed_wo_invcentrality, as.factor(test_seed_wo_invcentrality$funding_success), xgb_tuned_seed, n_repeats = 3)
+seed_funding_results_wo_invcentrality <- results_seed_wo_invcentrality$mean_results
+seed_funding_model_wo_invcentrality <- results_seed_wo_invcentrality$last_model
+
+results_seed_wo_patents <- train_and_evaluate(train_seed_task_wo_patents, test_seed_wo_patents, as.factor(test_seed_wo_patents$funding_success), xgb_tuned_seed, n_repeats = 3)
+seed_funding_results_wo_patents <- results_seed_wo_patents$mean_results
+seed_funding_model_wo_patents <- results_seed_wo_patents$last_model
+
+# Create a table to compare the results for each model
+seed_funding_results_table <- rbind(
+  seed_funding_results,
+  seed_funding_results_wo_comp,
+  seed_funding_results_wo_invcentrality,
+  seed_funding_results_wo_patents
+)
+
+# Save the seed_funding_results_table as csv file
+write.csv(seed_funding_results_table, "../seed_funding_results_table.csv")
+
+#---------------------------------------------------------------------------------
+
+# Save the series a train data as csv file
+write.csv(train_seriesa_scaled, "train_seriesa_scaled.csv")
+
+
+# Tune the xgboost model for series A funding data
+xgb_params_seriesa <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  eta = 0.01,
+  max_depth = 3,
+  min_child_weight = 5,
+  gamma = 3,
+  subsample = 0.8,
+  colsample_bytree = 0.6,
+  nrounds = 1500,
+  #alpha = 4,
+  #lambda = 2,
+  scale_pos_weight = pos_class_ratio_seriesa,
+  verbose = 1,
+  early_stopping_rounds = 20
+)
+
+xgb_tuned_seriesa <- makeLearner("classif.xgboost", predict.type = "prob", par.vals = xgb_params_seriesa)
+
+set.seed(33)
+results_seriesa <- train_and_evaluate(train_task_seriesa, test_seriesa_scaled, as.factor(test_seriesa_scaled$funding_success), xgb_tuned_seriesa, n_repeats = 1)
+seriesa_funding_results <- results_seriesa$mean_results
+seriesa_funding_model <- results_seriesa$last_model
+
+results_seriesa_wo_comp <- train_and_evaluate(train_seriesa_task_wo_comp, test_seriesa_wo_comp, as.factor(test_seriesa_wo_comp$funding_success), xgb_tuned_seriesa, n_repeats = 3)
+seriesa_funding_results_wo_comp <- results_seriesa_wo_comp$mean_results
+seriesa_funding_model_wo_comp <- results_seriesa_wo_comp$last_model
+
+results_seriesa_wo_invcentrality <- train_and_evaluate(train_seriesa_task_wo_invcentrality, test_seriesa_wo_invcentrality, as.factor(test_seriesa_wo_invcentrality$funding_success), xgb_tuned_seriesa, n_repeats = 3)
+seriesa_funding_results_wo_invcentrality <- results_seriesa_wo_invcentrality$mean_results
+seriesa_funding_model_wo_invcentrality <- results_seriesa_wo_invcentrality$last_model
+
+results_seriesa_wo_patents <- train_and_evaluate(train_seriesa_task_wo_patents, test_seriesa_wo_patents, as.factor(test_seriesa_wo_patents$funding_success), xgb_tuned_seriesa, n_repeats = 3)
+seriesa_funding_results_wo_patents <- results_seriesa_wo_patents$mean_results
+seriesa_funding_model_wo_patents <- results_seriesa_wo_patents$last_model
+
+# Create a table to compare the results for each model
+seriesa_funding_results_table <- rbind(
+  seriesa_funding_results,
+  seriesa_funding_results_wo_comp,
+  seriesa_funding_results_wo_invcentrality,
+  seriesa_funding_results_wo_patents
+)
+
+# Save the seriesa_funding_results_table as csv file
+write.csv(seriesa_funding_results_table, "../seriesa_funding_results_table.csv")
+
+
+# ----------------------------------------------------------------------------------------
+write.csv(train_seriesb_scaled, "train_seriesb_scaled.csv")
+xgb_params_seriesb <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.01,
+  max_depth = 3,
+  min_child_weight = 2,
+  gamma = 2.5,
+  subsample = 0.4,
+  colsample_bytree = 0.9,
+  nrounds = 1200,
+  #alpha = 2,
+  #lambda = 1,
+  scale_pos_weight = pos_class_ratio_seriesb,
+  verbose = 1,
+  early_stopping_rounds = 30
+)
+
+xgb_tuned_seriesb <- makeLearner("classif.xgboost", predict.type = "prob", par.vals = xgb_params_seriesb)
+
+results_seriesb <- train_and_evaluate(train_task_seriesb, test_seriesb_scaled, as.factor(test_seriesb_scaled$funding_success), xgb_tuned_seriesb, n_repeats = 3)
+seriesb_funding_results <- results_seriesb$mean_results
+seriesb_funding_model <- results_seriesb$last_model
+
+results_seriesb_wo_comp <- train_and_evaluate(train_seriesb_task_wo_comp, test_seriesb_wo_comp, as.factor(test_seriesb_wo_comp$funding_success), xgb_tuned_seriesb, n_repeats = 3)
+seriesb_funding_results_wo_comp <- results_seriesb_wo_comp$mean_results
+seriesb_funding_model_wo_comp <- results_seriesb_wo_comp$last_model
+
+results_seriesb_wo_invcentrality <- train_and_evaluate(train_seriesb_task_wo_invcentrality, test_seriesb_wo_invcentrality, as.factor(test_seriesb_wo_invcentrality$funding_success), xgb_tuned_seriesb, n_repeats = 3)
+seriesb_funding_results_wo_invcentrality <- results_seriesb_wo_invcentrality$mean_results
+seriesb_funding_model_wo_invcentrality <- results_seriesb_wo_invcentrality$last_model
+
+
+results_seriesb_wo_patents <- train_and_evaluate(train_seriesb_task_wo_patents, test_seriesb_wo_patents, as.factor(test_seriesb_wo_patents$funding_success), xgb_tuned_seriesb, n_repeats = 3)
+seriesb_funding_results_wo_patents <- results_seriesb_wo_patents$mean_results
+seriesb_funding_model_wo_patents <- results_seriesb_wo_patents$last_model
+
+# Create a table to compare the results for each model
+seriesb_funding_results_table <- rbind(
+  seriesb_funding_results,
+  seriesb_funding_results_wo_comp,
+  seriesb_funding_results_wo_invcentrality,
+  seriesb_funding_results_wo_patents
+)
+
+# Save the seriesb_funding_results_table as csv file
+write.csv(seriesb_funding_results_table, "../seriesb_funding_results_table.csv")
+
+```
+
+
+Below code chunk is used to generate SHAP values for the models trained above. The SHAP values are used to explain the model predictions. The SHAP values are calculated for the top 20 features. The SHAP values are then plotted to show the impact of each feature on the model predictions. 
+```{r, SHAP, fig.width=7, fig.height=6}
+
+# Convert the data to matrix
+X_train_all <- as.matrix(train_all_scaled[,-19])
+X_train_seed <- as.matrix(train_seed_scaled[,-19])
+X_train_seriesa <- as.matrix(train_seriesa_scaled[,-19])
+X_train_seriesb <- as.matrix(train_seriesb_scaled[,-19])
+
+# Calculate the SHAP values for the models
+shap_values <- shap.values(xgb_model = all_funding_model, X_train_all)
+
+shap_values_seed <- shap.values(xgb_model = seed_funding_model, X_train_seed)
+
+shap_values_seriesa <- shap.values(xgb_model = seriesa_funding_model, X_train_seriesa)
+
+shap_values_seriesb <- shap.values(xgb_model = seriesb_funding_model, X_train_seriesb)
+
+# Prepare the SHAP values for plotting
+shap_long_all <- shap.prep(xgb_model = all_funding_model, shap_contrib = shap_values$shap_score, X_train = X_train_all, top_n = 20)
+# Change the variable names to be more descriptive in the SHAP Plot
+# Example if variable name is days_since_last_funding, change it to Days Since Last Funding
+# Convert factor to character
+shap_long_all$variable <- as.character(shap_long_all$variable)
+
+# Define a named list for the new labels
+new_labels <- list(
+  "days_since_founded" = "Days Since Founded",
+  "days_since_last_funding" = "Days Since Last Funding",
+  "max_betweenness_centrality" = "Max Betweenness Centrality",
+  "mean_degree_centrality" = "Mean Degree Centrality",
+  "funding_total" = "Funding Total",
+  "num_founders" = "Nb. of Founders",
+  "last_round_funding" = "Last Round Funding",
+  "count" = "Nb. of Close Competitors",
+  "max_eigenvector_centrality" = "Max Eigenvector Centrality",
+  "num_prev_startups" = "Nb. of Previous Startups",
+  "prop_comp_raised_funds" = "Prop. of Competitors Funded last year",
+  "num_investors" = "Nb. of Investors",
+  "num_articles" = "Nb. of News Articles",
+  "avg_comp_funding" = "Avg. Funding of Competitors last year",
+  "num_funding_rounds" = "Nb. of Funding Rounds",
+  "Fashion_Beauty_Retail" = "Fashion, Beauty & Retail",
+  "Food_Beverage" = "Food & Beverage",
+  "Financing_Banking_Services" = "Financing & Banking Services",
+  "Agriculture_Supply_Chain" = "Agriculture & Supply Chain",
+  "prop_female_founders" = "Prop. of Female Founders", 
+  "Social_Community_Building" = "Social Community Building",
+  "Electric_Mobility_Renewables" = "Electric Mobility & Renewables",
+  "state_Haryana" = "Haryana State(HQ)",
+  "state_Karnataka" = "Karnataka State(HQ)",
+  "Data_Analytics_AI" = "Data Analytics & AI")
+
+# Update the feature names in shap_long_seriesa
+shap_long_all$variable <- sapply(shap_long_all$variable, function(x) new_labels[[x]])
+
+# Convert back variable to factors
+shap_long_all$variable <- factor(shap_long_all$variable, levels = unique(shap_long_all$variable))
+
+# Reverse the SHAP values
+shap_long_all$value <- -shap_long_all$value
+
+# Plot the SHAP values for all funding model
+shap_plot_all <- shap.plot.summary(shap_long_all, x_bound  = 1.2, dilute = 2) 
+
+```
+
+Plot the SHAP summary for the Seed Funding model
+
+```{r, SHAP Seed, fig.width=7, fig.height=6}
+shap_long_seed <- shap.prep(xgb_model = seed_funding_model, shap_contrib = shap_values_seed$shap_score, X_train = X_train_seed, top_n = 20)
+shap_long_seed$variable <- as.character(shap_long_seed$variable)
+
+# Define a named list for the new labels
+new_labels <- list(
+  "days_since_founded" = "Days Since Founded",
+  "days_since_last_funding" = "Days Since Last Funding",
+  "max_betweenness_centrality" = "Max Betweenness Centrality",
+  "mean_degree_centrality" = "Mean Degree Centrality",
+  "funding_total" = "Funding Total",
+  "num_founders" = "Nb. of Founders",
+  "last_round_funding" = "Last Round Funding",
+  "count" = "Nb. of Close Competitors",
+  "max_eigenvector_centrality" = "Max Eigenvector Centrality",
+  "num_prev_startups" = "Nb. of Previous Startups",
+  "prop_comp_raised_funds" = "Prop. of Competitors Funded last year",
+  "num_investors" = "Nb. of Investors",
+  "num_articles" = "Nb. of News Articles",
+  "avg_comp_funding" = "Avg. Funding of Competitors last year",
+  "num_funding_rounds" = "Nb. of Funding Rounds",
+  "Fashion_Beauty_Retail" = "Fashion, Beauty & Retail",
+  "Food_Beverage" = "Food & Beverage",
+  "Financing_Banking_Services" = "Financing & Banking Services",
+  "Agriculture_Supply_Chain" = "Agriculture & Supply Chain",
+  "prop_female_founders" = "Proportion of Female Founders", 
+  "Social_Community_Building" = "Social Community Building",
+  "Electric_Mobility_Renewables" = "Electric Mobility & Renewables",
+  "state_Haryana" = "Haryana State(HQ)",
+  "state_Karnataka" = "Karnataka State(HQ)")
+
+# Update the feature names in shap_long_seriesa
+shap_long_seed$variable <- sapply(shap_long_seed$variable, function(x) new_labels[[x]])
+
+# Convert back variable to factors
+shap_long_seed$variable <- factor(shap_long_seed$variable, levels = unique(shap_long_seed$variable))
+shap_long_seed$value <- -shap_long_seed$value
+
+# Plot the SHAP values for seed funding model
+shap_plot_seed <- shap.plot.summary(shap_long_seed, x_bound  = 1.2)
+
+```
+
+
+Plot the SHAP summary for the Series A Funding model
+```{r, SHAP Series A, fig.width=7, fig.height=6}
+
+shap_long_seriesa <- shap.prep(xgb_model = seriesa_funding_model, shap_contrib = shap_values_seriesa$shap_score, X_train = X_train_seriesa, top_n = 20)
+# Convert factor to character
+shap_long_seriesa$variable <- as.character(shap_long_seriesa$variable)
+
+# Define a named list for the new labels
+new_labels <- list(
+  "days_since_founded" = "Days Since Founded",
+  "days_since_last_funding" = "Days Since Last Funding",
+  "max_betweenness_centrality" = "Max Betweenness Centrality",
+  "mean_degree_centrality" = "Mean Degree Centrality",
+  "funding_total" = "Funding Total",
+  "num_founders" = "Nb. of Founders",
+  "last_round_funding" = "Last Round Funding",
+  "count" = "Nb. of Close Competitors",
+  "max_eigenvector_centrality" = "Max Eigenvector Centrality",
+  "num_prev_startups" = "Nb. of Previous Startups",
+  "prop_comp_raised_funds" = "Prop. of Competitors Funded last year",
+  "num_investors" = "Nb. of Investors",
+  "num_articles" = "Nb. of News Articles",
+  "avg_comp_funding" = "Avg. Funding of Competitors last year",
+  "num_funding_rounds" = "Nb. of Funding Rounds",
+  "Fashion_Beauty_Retail" = "Fashion, Beauty & Retail",
+  "Food_Beverage" = "Food & Beverage",
+  "Financing_Banking_Services" = "Financing & Banking Services",
+  "Agriculture_Supply_Chain" = "Agriculture & Supply Chain",
+  "prop_female_founders" = "Proportion of Female Founders")
+
+# Update the feature names in shap_long_seriesa
+shap_long_seriesa$variable <- sapply(shap_long_seriesa$variable, function(x) new_labels[[x]])
+
+# Convert back variable to factors
+shap_long_seriesa$variable <- factor(shap_long_seriesa$variable, levels = unique(shap_long_seriesa$variable))
+
+# Reverse the SHAP values
+shap_long_seriesa$value <- -shap_long_seriesa$value
+
+# Plot the SHAP values for series A funding model
+shap_plot_seriesa <- shap.plot.summary(shap_long_seriesa, x_bound  = 1.2)
+
+```
+
+Plot the SHAP summary for the Series B Funding model
+```{r, SHAP Series B, fig.width=7, fig.height=6}
+shap_long_seriesb <- shap.prep(xgb_model = seriesb_funding_model, shap_contrib = shap_values_seriesb$shap_score, X_train = X_train_seriesb, top_n = 20)
+shap_long_seriesb$variable <- as.character(shap_long_seriesb$variable)
+
+# Define a named list for the new labels
+new_labels <- list(
+  "days_since_founded" = "Days Since Founded",
+  "days_since_last_funding" = "Days Since Last Funding",
+  "max_betweenness_centrality" = "Max Betweenness Centrality",
+  "mean_degree_centrality" = "Mean Degree Centrality",
+  "funding_total" = "Funding Total",
+  "num_founders" = "Nb. of Founders",
+  "last_round_funding" = "Last Round Funding",
+  "count" = "Nb. of Close Competitors",
+  "max_eigenvector_centrality" = "Max Eigenvector Centrality",
+  "num_prev_startups" = "Nb. of Previous Startups",
+  "prop_comp_raised_funds" = "Prop. of Competitors Funded last year",
+  "num_investors" = "Nb. of Investors",
+  "num_articles" = "Nb. of News Articles",
+  "avg_comp_funding" = "Avg. Funding of Competitors last year",
+  "num_funding_rounds" = "Nb. of Funding Rounds",
+  "Fashion_Beauty_Retail" = "Fashion, Beauty & Retail",
+  "Food_Beverage" = "Food & Beverage",
+  "Financing_Banking_Services" = "Financing & Banking Services",
+  "Agriculture_Supply_Chain" = "Agriculture & Supply Chain",
+  "prop_female_founders" = "Prop. of Female Founders", 
+  "Social_Community_Building" = "Social Community Building",
+  "Electric_Mobility_Renewables" = "Electric Mobility & Renewables",
+  "state_Haryana" = "Haryana State(HQ)",
+  "state_Karnataka" = "Karnataka State(HQ)",
+  "Data_Analytics_AI" = "Data Analytics & AI",
+  "Healthcare" = "Healthcare")
+
+# Update the feature names in shap_long_seriesa
+shap_long_seriesb$variable <- sapply(shap_long_seriesb$variable, function(x) new_labels[[x]])
+
+# Convert back variable to factors
+shap_long_seriesb$variable <- factor(shap_long_seriesb$variable, levels = unique(shap_long_seriesb$variable))
+# Reverse the SHAP values
+shap_long_seriesb$value <- -shap_long_seriesb$value
+# Plot the SHAP values for series B funding model
+shap_plot_seriesb <- shap.plot.summary(shap_long_seriesb, x_bound  = 1.4)
+
+
+```
+
+Below code chunk can be used to plot the distribution of missing values in the dataset
+```{r, fig.width=12, fig.height=10}
+install.packages("naniar")
+library(naniar)
+gg_miss_var(all_funding) + labs(title = "Missing Data Pattern")
+
+```
+
+Below code chunk can be used to plot the histograms of the features in the dataset, to understand the distribution of the features
+```{r, fig.width=12, fig.height=6}
+#install.packages("DataExplorer")
+library(DataExplorer)
+
+# Plot histograms for all features
+plot_histogram(merged_df)
+
+```
